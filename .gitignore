@@ -28,4 +28,4 @@ scripts/gen_formulas.js
 scripts/gen_logo.py
 scripts/gen_prose_check.js
 scripts/generate_prose.js
-src/config-watch.json
+.gitignore
