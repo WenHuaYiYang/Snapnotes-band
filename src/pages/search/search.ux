@@ -1,0 +1,328 @@
+<import name="input-method" src="../../components/InputMethod/InputMethod.ux"></import>
+
+<template>
+  <div class="container">
+
+    <img class="leftButton top" src="/common/images/back.png" @click="goBack" static />
+    <text class="time">{{ currentTime }}</text>
+    <text class="title" static><span>搜索</span></text>
+
+    <div style="height: 6px;"></div>
+
+    <!-- 搜索框 -->
+    <div class="search-bar">
+      <div class="search-bar__inner" @click="toggleKeyboard">
+        <text class="search-bar__text">{{ textValue || '搜索知识点...' }}</text>
+      </div>
+    </div>
+
+    <!-- 搜索结果列表（键盘显示时缩小高度，给键盘腾出空间） -->
+    <scroll class="box {{ !hideKeyboard ? 'box--with-keyboard' : '' }}" scroll-x="false" scroll-y="true" bounces="true">
+      <!-- 加载中占位（首帧先就位，避免进页瞬间预算 150 条 haystack 卡顿） -->
+      <div class="search-loading" if="{{!ready}}">
+        <text class="search-loading__text" static>加载中...</text>
+      </div>
+
+      <div class="subject-item" for="{{searchResults}}" if="{{ready}}" @click="onResultClick($idx)">
+        <div class="subject-item__card result-card">
+          <text class="result-subject">{{ $item.subjectName }}</text>
+          <text class="result-title">{{ $item.title }}</text>
+          <text class="result-desc">{{ $item.desc }}</text>
+        </div>
+      </div>
+
+      <div class="subject-item" if="{{ready && searchResults.length === 0}}">
+        <div class="subject-item__card" style="justify-content: center;">
+          <text class="result-empty__text" static>{{ hasSearched ? '暂无相关结果' : '点击搜索框输入关键词' }}</text>
+        </div>
+      </div>
+
+      <div class="padding"></div>
+    </scroll>
+
+    <!-- 输入法键盘：组件自带 position:absolute;bottom:0 定位，直接放在 container 下即可 -->
+    <input-method
+      hide="{{hideKeyboard}}"
+      keyboardtype="QWERTY"
+      screentype="rect"
+      maxlength="5"
+      @complete="onComplete"
+      @delete="onDelete"
+    ></input-method>
+  </div>
+</template>
+
+<script>
+import router from '@system.router'
+import { onTimeChange, offTimeChange } from '../../common/clock'
+
+export default {
+  private: {
+    textValue: '',
+    hideKeyboard: true,
+    searchResults: [],
+    allItems: [],
+    hasSearched: false,
+    ready: false,
+    currentTime: '00:00'
+  },
+
+  onInit() {
+    this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
+    // 进页即构建 allItems（含预算好的 haystack 缓存），但不渲染。
+    // searchResults 保持空，首屏只画占位，避免进页瞬间渲染 150 张卡片的卡顿。
+    // haystack 在此预算一次：把学科名/标题/描述/知识要点正文拼成单串并转小写，
+    // 之后每次搜索只做 indexOf，不再每键重新 join + toLowerCase（这是输入卡顿的根因）。
+    // 数据源走 $app.$def.store.getAllItems（内置 + 用户导入合并后的全量扁平条目）。
+    // ready=false 让 scroll 内只画「加载中」占位，把 150 条预算推到下一帧，
+    // 标题/搜索框/背景先就位，进页顺滑（同 detail/knowledge 范式）。
+    setTimeout(() => {
+      const items = this.$app.$def.store.getAllItems()
+      const all = []
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i]
+        const haystack = (
+          it.subjectName + '\n' +
+          it.title + '\n' +
+          it.desc + '\n' +
+          (it.points || []).join('\n')
+        ).toLowerCase()
+        all.push({
+          title: it.title,
+          desc: it.desc,
+          points: it.points,
+          subjectName: it.subjectName,
+          haystack: haystack
+        })
+      }
+      this.allItems = all
+      this.ready = true
+    }, 50)
+  },
+
+  onDestroy() {
+    if (this.__unsubClock) {
+      offTimeChange(this.__unsubClock)
+    }
+  },
+
+  toggleKeyboard() {
+    this.hideKeyboard = !this.hideKeyboard
+  },
+
+  onComplete(evt) {
+    const ch = evt.detail.content || ''
+    this.textValue += ch
+    this.scheduleSearch()
+  },
+
+  onDelete() {
+    if (this.textValue.length > 0) {
+      this.textValue = this.textValue.slice(0, -1)
+      this.scheduleSearch()
+    }
+  },
+
+  // 防抖：连续敲键只在停顿后搜一次，避免每键全量扫描；即时性靠 220ms 平衡。
+  // 保证同一时间最多一个定时器，新按键会取消上一个未触发的搜索。
+  scheduleSearch() {
+    if (this.__searchTimer) {
+      clearTimeout(this.__searchTimer)
+    }
+    this.__searchTimer = setTimeout(() => {
+      this.__searchTimer = null
+      this.doSearch()
+    }, 220)
+  },
+
+  doSearch() {
+    const kw = this.textValue.toLowerCase().trim()
+    if (!kw) {
+      // 关键词清空：保持空态占位，不再回填全部卡片（回填会瞬间渲染 150 张）
+      this.hasSearched = false
+      this.searchResults = []
+      return
+    }
+    this.hasSearched = true
+    const all = this.allItems
+    const matched = []
+    for (let i = 0; i < all.length; i++) {
+      // haystack 已在 onInit 预算缓存，这里只做 indexOf，无 join/toLowerCase 开销
+      if (all[i].haystack.indexOf(kw) !== -1) {
+        matched.push(all[i])
+      }
+    }
+    this.searchResults = matched
+  },
+
+  goBack() {
+    router.back()
+  },
+
+  onResultClick(index) {
+    const item = this.searchResults[index]
+    router.push({
+      uri: '/pages/content',
+      params: { subjectName: item.subjectName, title: item.title }
+    })
+  }
+}
+</script>
+
+<style>
+@import '../../common/style.css';
+
+.container {
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: center;
+  background-color: #0A0A0C;
+  height: 100%;
+  width: 100%;
+  position: relative;
+}
+
+.title {
+  position: relative;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 32px;
+  font-weight: bold;
+  color: #FFFFFF;
+}
+
+.time {
+  position: relative;
+  top: 4px;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 22px;
+  font-weight: bold;
+  color: rgba(255,255,255,0.5);
+}
+
+.leftButton {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  width: 72px;
+  height: 72px;
+}
+
+.box {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* 键盘弹出时，搜索结果区缩到上半屏 */
+.box--with-keyboard {
+  height: 240px;
+  flex: 0 0 240px;
+}
+
+/* ---------- 输入法键盘浮层：绝对定位贴底 ---------- */
+.keyboard-layer {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  z-index: 999;
+}
+.padding {
+  height: 90px;
+}
+
+/* ---------- 搜索框 ---------- */
+.search-bar {
+  width: 100%;
+  padding: 0 12px;
+  margin-bottom: 8px;
+}
+
+.search-bar__inner {
+  width: 100%;
+  height: 56px;
+  background-color: #18181A;
+  border: 1px solid #2A2A2E;
+  border-radius: 28px;
+  padding: 0 24px;
+  flex-direction: row;
+  align-items: center;
+}
+
+.search-bar__text {
+  flex: 1;
+  font-size: 26px;
+  color: #FFFFFF;
+  line-height: 56px;
+}
+
+/* ---------- 结果卡片 ---------- */
+.subject-item {
+  padding: 0 12px;
+  margin-bottom: 10px;
+}
+
+/* ---------- 结果卡片（覆盖 common/style.css 中 subject-item / subject-item__card 的固定高度） ---------- */
+.subject-item {
+  height: auto !important;
+}
+
+.subject-item__card.result-card {
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  height: auto !important;
+  min-height: 0 !important;
+  line-height: normal;
+  padding: 12px 20px;
+}
+
+.result-subject {
+  color: #7899BB;
+  font-size: 22px;
+  margin-bottom: 4px;
+}
+
+.result-title {
+  color: #FFFFFF;
+  font-size: 28px;
+  font-weight: 600;
+  lines: 1;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+  width: 100%;
+}
+
+.result-desc {
+  color: #98989E;
+  font-size: 20px;
+  lines: 1;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+
+.result-empty__text {
+  color: #98989E;
+  font-size: 24px;
+}
+
+/* 进页加载占位（同 detail/knowledge 范式） */
+.search-loading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  width: 100%;
+}
+
+.search-loading__text {
+  color: #98989E;
+  font-size: 24px;
+}
+</style>

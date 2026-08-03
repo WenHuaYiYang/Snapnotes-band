@@ -1,0 +1,213 @@
+<template>
+  <div class="container">
+    <!-- 返回按钮 -->
+    <img
+      class="leftButton top"
+      src="/common/images/back.png"
+      @click="goBack"
+      static
+    />
+    <!-- 时间 -->
+    <text class="time">{{ currentTime }}</text>
+    <!-- 标题 -->
+    <text class="title" static>
+      <span>{{ subjectName }}</span>
+    </text>
+
+    <div style="height: 6px;"></div>
+
+    <!-- 滚动容器 -->
+    <div class="box">
+      <scroll class="box" scroll-x="false" scroll-y="true" bounces="true">
+        <!-- 加载中占位（首帧先就位，避免进页瞬间渲染 68 张卡片卡顿） -->
+        <div class="knowledge-loading" if="{{!ready}}">
+          <text class="knowledge-loading__text" static>加载中...</text>
+        </div>
+
+        <!-- 知识点列表 -->
+        <div class="knowledge-item" if="{{ready}}" for="{{knowledgeList}}" @click="onKnowledgeClick($idx)">
+          <div class="knowledge-card">
+            <text class="knowledge-title">{{ $item.title }}</text>
+            <text class="knowledge-desc">{{ $item.desc }}</text>
+          </div>
+        </div>
+
+        <!-- 空状态 -->
+        <div class="knowledge-item" if="{{knowledgeList.length === 0 && ready}}" style="height: 80px; flex-direction: row; align-items: center; justify-content: center;">
+          <text style="color: #98989E; font-size: 24px;" static>暂无知识点</text>
+        </div>
+
+        <!-- 底部占位 -->
+        <div class="padding"></div>
+      </scroll>
+    </div>
+
+    <!-- 悬浮按钮 -->
+    <img src="/common/images/search.png" @click="openSearch" class="fab fab--search" static />
+    <img src="/common/images/chat.png" @click="openChat" class="fab fab--chat" static />
+  </div>
+</template>
+
+<script>
+import router from '@system.router'
+import { onTimeChange, offTimeChange } from '../../common/clock'
+
+export default {
+  protected: {
+    subjectName: ''
+  },
+  private: {
+    knowledgeList: [],
+    ready: false,
+    currentTime: "00:00"
+  },
+  onInit() {
+    const name = this.subjectName || '语文'
+    this.subjectName = name
+    this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
+    // 进页先用空 list：首帧只画标题/空态，避免进页瞬间渲染 68 张卡片(尤其语文)造成卡顿。
+    // 真实数据推迟到下一帧再填充，让标题与背景先就位，68 张卡片在已就绪的页面背景上绘制，
+    // 用户感知的是「页面已开」而非「卡住」。保留 scroll+div for 结构不变，滑动体验不受影响。
+    this.__pendingList = this.getKnowledgeBySubject(name)
+    this.knowledgeList = []
+    setTimeout(() => {
+      this.knowledgeList = this.__pendingList
+      this.__pendingList = null
+      this.ready = true
+    }, 50)
+  },
+  onDestroy() {
+    if (this.__unsubClock) {
+      offTimeChange(this.__unsubClock)
+    }
+  },
+  getKnowledgeBySubject(name) {
+    return this.$app.$def.store.getKnowledge(name)
+  },
+  goBack() {
+    router.back()
+  },
+  onKnowledgeClick(index) {
+    const item = this.knowledgeList[index]
+    router.push({
+      uri: '/pages/content',
+      params: { subjectName: this.subjectName, title: item.title }
+    })
+  },
+  openSearch() {
+    router.push({ uri: '/pages/search' })
+  },
+  openChat() {
+    router.push({ uri: '/pages/chat' })
+  }
+}
+</script>
+
+<style>
+@import '../../common/style.css';
+
+.container {
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: center;
+  background-color: #0A0A0C;
+  height: 100%;
+  width: 100%;
+  padding: 8px 0;
+}
+
+.title {
+  position: relative;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 32px;
+  font-weight: bold;
+  color: #FFFFFF;
+}
+
+.time {
+  position: relative;
+  top: 4px;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 22px;
+  font-weight: bold;
+  color: rgba(255,255,255,0.5);
+}
+
+.leftButton {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  width: 72px;
+  height: 72px;
+}
+
+.box {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+}
+
+.padding {
+  height: 90px;
+}
+
+/* 进页加载占位 */
+.knowledge-loading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  width: 100%;
+}
+
+.knowledge-loading__text {
+  color: #98989E;
+  font-size: 24px;
+}
+
+
+/* ---------- 知识点列表项（性能优化：对齐 index 不卡顿的渲染模式） ---------- */
+.knowledge-item {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  height: 88px;
+  background-color: transparent;
+  padding: 0 12px;
+  margin-bottom: 10px;
+  width: 100%;
+}
+
+.knowledge-card {
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  height: 74px;
+  background-color: #18181A;
+  border-radius: 20px;
+  padding: 0 18px;
+  border: 1px solid #2A2A2E;
+}
+
+.knowledge-title {
+  color: #FFFFFF;
+  font-size: 28px;
+  font-weight: 600;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+.knowledge-desc {
+  color: #98989E;
+  font-size: 20px;
+  margin-top: 6px;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+</style>

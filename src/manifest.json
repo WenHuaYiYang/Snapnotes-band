@@ -1,0 +1,67 @@
+{
+  "package": "com.whyy.snapnotes",
+  "name": "闪念小抄",
+  "versionName": "1.0.0",
+  "versionCode": 1,
+  "minPlatformVersion": 1000,
+  "icon": "/common/logo.png",
+  "deviceTypeList": [
+    "watch"
+  ],
+  "features": [
+    {
+      "name": "system.app"
+    },
+    {
+      "name": "system.router"
+    },
+    { 
+      "name": "system.prompt" 
+    },
+    {
+      "name": "system.storage"
+    },
+    {
+      "name": "system.vibrator"
+    },
+    {
+      "name": "system.device"
+    },
+    {
+      "name": "system.interconnect"
+    },
+    {
+      "name": "system.file"
+    }
+  ],
+  "config": {
+    "logLevel": "log",
+    "designWidth": "device-width"
+  },
+  "router": {
+    "entry": "pages/index",
+    "pages": {
+      "pages/index": {
+        "component": "index"
+      },
+      "pages/detail": {
+        "component": "detail"
+      },
+      "pages/knowledge": {
+        "component": "knowledge"
+      },
+      "pages/content": {
+        "component": "content"
+      },
+      "pages/search": {
+        "component": "search"
+      },
+      "pages/import": {
+        "component": "import"
+      },
+      "pages/chat": {
+        "component": "chat"
+      }
+    }
+  }
+}

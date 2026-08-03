@@ -1,0 +1,221 @@
+<template>
+  <div class="container">
+    <!-- 返回按钮 -->
+    <img
+      class="leftButton top"
+      src="/common/images/back.png"
+      @click="handleClick"
+      static
+    />
+    <!-- 时间 -->
+    <text class="time">{{ currentTime }}</text>
+    <!-- 标题 -->
+    <text class="title" static>
+      <span>闪念小抄</span>
+    </text>
+    <!-- more 按钮 -->
+    <img
+      class="rightButton top"
+      src="/common/images/more.png"
+      @click="showInfo"
+      static
+    />
+
+    <div style="height: 6px;"></div>
+
+    <!-- 加载占位（首帧先就位，避免进页瞬间渲染学科列表卡顿） -->
+    <div class="content-loading" if="{{!loaded}}">
+      <text class="content-loading__text" static>加载中...</text>
+    </div>
+
+    <!-- 滚动容器 -->
+    <div class="box" if="{{loaded}}">
+      <scroll class="box" scroll-x="false" scroll-y="true" bounces="true">
+        <!-- 学科列表 -->
+        <div class="subject-item" for="{{subjects}}" @click="goToDetail($idx)">
+          <div class="subject-item__card">
+            <marquee
+              class="subject-item__name"
+              scrollamount="20"
+              text-offset="30"
+              loop="-1"
+            >{{ $item.name }}</marquee>
+            <!-- 用户导入科目角标（内置科目不显示） -->
+            <text class="subject-item__imported" if="{{ $item.imported }}" static>导入</text>
+            <text class="subject-item__badge">{{ $item.count }}个知识点</text>
+          </div>
+        </div>
+
+        <!-- 底部占位 -->
+        <div class="padding"></div>
+      </scroll>
+    </div>
+
+    <!-- 悬浮按钮 -->
+    <img src="/common/images/search.png" @click="openSearch" class="fab fab--search" static />
+    <img src="/common/images/chat.png" @click="openChat" class="fab fab--chat" static />
+  </div>
+</template>
+
+<script>
+import app from "@system.app"
+import router from "@system.router";
+import { onTimeChange, offTimeChange } from '../../common/clock'
+
+export default {
+  private: {
+    subjects: [],
+    loaded: false,
+    currentTime: "00:00"
+  },
+  
+  onInit() {
+    // 走 $app.$def.store（app.ux 挂载的同一份实例），保证 detail 加载扩展后此页读到的是更新后的状态。
+    this.subjects = this.$app.$def.store.getSubjects()
+    this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
+    // 订阅"用户数据已从持久化读回"事件:app.ux onCreate 调 _loadPersistedUserData 走 file.readText
+    // 异步回调,本页 onInit/onShow 同步读 getSubjects() 时 userSubjects 可能仍为 null(只有内置),
+    // 用户新导入的科目显示不出。读回成功后 app.ux 广播 userdata-loaded,此处命中即刷新,
+    // 解决"重进首页不见导入科目、要翻页返回才出现"的异步竞态。
+    // 同时订阅 userdata-changed:删除导入科目(app.ux removeImportedSubject)后也刷新科目数。
+    this.__unsubReceive = this.$app.$def.onReceive((evt) => {
+      if (evt && (evt.kind === 'userdata-loaded' || evt.kind === 'userdata-changed')) {
+        this.subjects = this.$app.$def.store.getSubjects()
+      }
+    })
+    // 学科数据立即备好(10 项 map,轻),但 loaded=false 让 scroll 不进 DOM,首帧只画标题+占位。
+    // 50ms 后切 loaded=true 渲染列表,让标题与悬浮按钮先就位,进页不卡。
+    setTimeout(() => {
+      this.loaded = true
+    }, 50)
+  },
+
+  // 每次页面显示都重读科目列表：从 detail「拓展知识点」加载扩展包后返回 index，
+  // store 已增量更新，此处刷新让用户新增的「导入」科目立即出现。
+  // onShow 在 onInit 后首次显示也会触发一次，同步重读无副作用。
+  onShow() {
+    this.subjects = this.$app.$def.store.getSubjects()
+  },
+
+  onDestroy() {
+    if (this.__unsubClock) {
+      offTimeChange(this.__unsubClock)
+    }
+    // 解订接收事件回调,避免页面销毁后 app.ux 仍持有它的引用
+    if (this.__unsubReceive) {
+      this.__unsubReceive()
+    }
+  },
+
+  goToDetail(index) {
+    const subject = this.subjects[index]
+    router.push({
+      uri: '/pages/knowledge',
+      params: { subjectName: subject.name }
+    })
+  },
+
+  handleClick() { app.terminate() },
+  showInfo() { router.push({ uri: '/pages/detail' }) },
+  openSearch() { router.push({ uri: '/pages/search' }) },
+  openChat() { router.push({ uri: '/pages/chat' }) }
+}
+</script>
+
+<style>
+@import '../../common/style.css';
+
+.container {
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: center;
+  background-color: #0A0A0C;
+  height: 100%;
+  width: 100%;
+  padding: 8px 0;
+}
+
+.title {
+  position: relative;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 32px;
+  font-weight: bold;
+  color: rgba(255, 255, 255, 1);
+}
+
+.time {
+  position: relative;
+  top: 4px;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 22px;
+  font-weight: bold;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.leftButton {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  width: 72px;
+  height: 72px;
+}
+
+.rightButton {
+  position: absolute;
+  right: 16px;
+  top: 16px;
+  width: 72px;
+  height: 72px;
+}
+
+.box {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+}
+
+.content-loading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  width: 100%;
+}
+
+.content-loading__text {
+  color: #98989E;
+  font-size: 24px;
+}
+
+.padding {
+  height: 90px;
+}
+
+/* 复用 common/style.css 中的 subject-item 样式，但覆盖 padding */
+.subject-item {
+  padding: 0 12px;
+  margin-bottom: 10px;
+}
+
+/* 用户导入科目角标：胶囊描边淡蓝，置 badge 之前，不破坏 space-between 行结构 */
+.subject-item__imported {
+  color: #7899BB;
+  font-size: 18px;
+  font-weight: bold;
+  background-color: rgba(120, 153, 187, 0.12);
+  border: 1px solid rgba(120, 153, 187, 0.4);
+  border-radius: 6px;
+  padding: 2px 8px;
+  flex-shrink: 0;
+  margin-left: 8px;
+  line-height: 22px;
+}
+
+
+</style>

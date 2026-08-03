@@ -1,0 +1,640 @@
+<script>
+import storage from '@system.storage'
+import file from '@system.file'
+import interconnect from '@system.interconnect'
+import app from '@system.app'
+import device from '@system.device'
+import knowledgeStore from './common/knowledgeStore'
+
+// 用户数据持久化文件路径:几百 KB 知识点 JSON 走 file 而非 storage(官方把 storage 列为"用完即释放"
+// 不建议存大块数据,见 vela开发文档.md:2735-2818/5256)。internal://files/ 映射到应用私有沙箱
+// /data/quickapp/file/{package}/,重启后仍在(非 cache 可清、非 mass 可能不可用)。
+const USER_DATA_URI = 'internal://files/snapnotes_user_knowledge.json'
+// 兼容旧版:探针前用户数据存 storage 这个 key(已落盘过的已装用户走这读回)。
+const LEGACY_STORAGE_KEY = 'snapnotes_user_knowledge'
+
+// ====== 配套安卓端协议常量(与 InterHandshake.kt / JsonFilePusher.kt 对齐,见配套开发文档第 1 章) ======
+// 握手 tag:三方来回,10s 超时,5s 心跳。手环被动应答(手机端先发 count=0)。
+const HS_TAG = '__hs__'
+const HS_TIMEOUT_MS = 10000     // 握手阶段无后续 count 逾时清理
+const HEARTBEAT_INTERVAL_MS = 5000 // 握手成功后周期性回 count=0 保活
+// 手环端版本号:握手时回传给手机端做兼容性校验。与 manifest.json versionCode 同步。
+// (Vela 框架取 manifest.versionCode 的途径不稳,改用常量与发版同步,文档 1.4 表同款做法。)
+const BAND_VERSION_CODE = 1
+
+export default {
+  // 把 store 挂到 $def：所有页面通过 this.$app.$def.store 取同一份实例。
+  // 原因：实测各页 import 同一 common .js 后模块级状态不互通（detail 加载扩展、index 读仍为旧值），
+  // 改用文档背书的「app.ux 暴露给所有页面的应用级对象」（vela开发文档.md 5991/6225/6374）作跨页共享通道。
+  store: knowledgeStore,
+  // interconnect 接收单例:挂到 $def 让它跨页存活(接 onmessage 不依赖某个页生命周期)。
+  // 探雷真机已验此路在 10 Pro 立得起来(instance ok / onopen 触发 / onmessage 可挂)。
+  interconnect: null,
+  // 接收事件订阅者数组:导入页等想看"收到/并入/落盘"事件的页面 onInit 时 push 一个回调,
+  // onDestroy 时 splice 掉。onmessage 和 receiveImportedJSON 都会向这里广播。
+  // 轻量(多数时候空数组),不引第三方事件库。
+  _receiveListeners: [],
+  // 握手/心跳定时器(第 7 章)。跨页存活(挂 $def,不随某页销毁)。
+  hsTimeoutTimer: null,   // 握手阶段超时定时器(发完 count=1 等待 count=2)
+  hbTimer: null,          // 心跳定时器(握手成功后周期发 count=0)
+  // file tag 分片重组状态机(第 8 章)。跨页存活,手机端推一整个 JSON 期间的状态都在此。
+  fileState: null,        // 见 _newFileState(),传输开始时初始化
+  // chat tag 会话 + 分片重组 + 订阅(第 10 章: AI 聊天助手 Amadeus)。跨页存活。
+  // 上下文在手机端维护(按 sessionId),手环端只存本轮 sessionId,不存历史、不持久化。
+  chatSession: null,        // { sessionId } 当前会话;null=未开/未连
+  chatReplyState: null,     // 分片重组状态机(同 file 思路): {buffer, totalChunks, received, receiving, sessionId}
+  chatListeners: [],        // 订阅 chat 事件的页面回调(同 _receiveListeners 风格)
+  chatWatchdog: null,       // 发 chat_request 后 15s 超时定时器,兜"手机端未对接/无响应"
+  // 用户数据"已从持久化读回"标志 + 广播。解决异步竞态:_loadPersistedUserData 走 file.readText
+  // 异步回调,app onCreate 之后 index onInit/onShow 同步读 getSubjects() 时 userSubjects 仍为 null,
+  // 首页看不到用户新导入的科目;读回调返校 userSubjects 已填,但 index 已渲染完无法感知,要等下次
+  // onShow(翻页返回)才刷新。此处加载成功后广播事件,首页订阅命中即刷新,无需翻页。
+  userDataLoaded: false,
+  // 供页面/真接收共用的"接收一条 JSON 字符串"入口:parse→mergeParsedInto→落盘全量快照。
+  // 返回 {ok:boolean, reason?:string, len?:number} 让调用方(导入页自验按钮、将来手机端联调)能拿结论。
+  // 真接收 onmessage 和导入页本地自验按钮都走这个同一入口,确保两条路径行为完全一致。
+  receiveImportedJSON(jsonStr) {
+    const s = (jsonStr != null) ? String(jsonStr) : ''
+    if (!s) return { ok: false, reason: 'empty' }
+    let parsed
+    try {
+      parsed = JSON.parse(s)
+    } catch (e) {
+      return { ok: false, reason: 'parse-fail' }
+    }
+    try {
+      knowledgeStore.mergeParsedInto(parsed)
+    } catch (e) {
+      return { ok: false, reason: 'merge-fail' }
+    }
+    // 并入即活(内存态新科目立即可见);落盘当前全量快照(非本条,否则覆盖既有用户数据)。
+    const persistResult = this._persistCurrentUserData()
+    this._broadcastReceive({
+      kind: 'imported',
+      len: s.length,
+      persisted: persistResult.ok,
+      persistCode: persistResult.code
+    })
+    return { ok: true, len: s.length, persisted: persistResult.ok }
+  },
+  // 删除一个已导入科目:调 store 删 → 落盘全量快照 → 广播 userdata-changed 让 index 页刷新科目数。
+  // 仅外部科目(builtinNames 无对应)可删,内置同名延伸条目不在此处理(store.removeSubject 内自带保护)。
+  // 返回 {ok:boolean, reason?:string, persisted?:boolean} 供调用方(import 页)提示。
+  removeImportedSubject(name) {
+    const removed = knowledgeStore.removeSubject(name)
+    if (!removed) return { ok: false, reason: 'not-found' }
+    const persistResult = this._persistCurrentUserData()    // 写回全量快照(删后的 userSubjects)
+    this._broadcastReceive({ kind: 'userdata-changed' })     // 无标志,每次删都发:index/import 同步刷新
+    return { ok: true, persisted: persistResult.ok }
+  },
+  // 页面订阅接收事件。返回一个 unsubscribe 函数,页面 onDestroy 调即可解订。
+  onReceive(cb) {
+    if (typeof cb !== 'function') return () => {}
+    this._receiveListeners.push(cb)
+    return () => {
+      const i = this._receiveListeners.indexOf(cb)
+      if (i >= 0) this._receiveListeners.splice(i, 1)
+    }
+  },
+  _broadcastReceive(evt) {
+    const list = this._receiveListeners
+    for (let i = 0; i < list.length; i++) {
+      try { list[i](evt) } catch (e) { /* 单个监听者异常不影响其余 */ }
+    }
+  },
+  onCreate() {
+    // 1) 先读回已持久化的用户知识点数据(优先 file,退 storage 兼容旧版/无 file 机型)。
+    this._loadPersistedUserData()
+
+    // 2) 挂 interconnect 接收:手机端配套 app 用 MessageApi.sendMessage(nodeId, byte[]) 推 JSON,
+    //    表上 connect.onmessage 收到 String → parse → mergeParsedInto → file 落盘。
+    //    canIUse false(该机型 feature 未开通)时静默跳过,不影响其余功能。
+    this._setupInterconnect()
+  },
+  onDestroy() {
+    // 清理握手/心跳定时器,避免 app 销毁后定时器空跑报错
+    this._hsCleanup()
+    console.log("app destroyed")
+  },
+
+  // 读回持久化用户数据。file 优先(几百 KB 走文件),失败/无文件再退 storage.get 旧 key。
+  _loadPersistedUserData() {
+    if (app.canIUse('@system.file')) {
+      file.readText({
+        uri: USER_DATA_URI,
+        success: (r) => {
+          if (r && r.text) {
+            // setUserData 内部 JSON.parse + mergeParsedInto,非法静默丢弃不崩。
+            knowledgeStore.setUserData(r.text)
+            console.log('user data loaded from file')
+            this._broadcastUserDataLoaded()
+          }
+        },
+        // 读不到文件(首装/未导入过)走 storage 旧 key 兼容
+        fail: () => { this._loadFromStorage() }
+      })
+    } else {
+      // 无 file feature:只能退 storage
+      this._loadFromStorage()
+    }
+  },
+  _loadFromStorage() {
+    storage.get({
+      key: LEGACY_STORAGE_KEY,
+      success: (data) => {
+        // 空 / 非法 由 store.setUserData 内部兜底，不会让内置数据丢失
+        if (data) {
+          knowledgeStore.setUserData(data)
+          this._broadcastUserDataLoaded()
+        }
+      },
+      fail: function() {}
+    })
+  },
+  // 用户数据从持久化读回成功后广播一次。已加载过则不重复广播(receiveImportedJSON/分片重组
+  // 并入新条目不触发此事件——那些是运行时增量,广播 imported 给导入页即可,首页 onShow 能覆盖)。
+  _broadcastUserDataLoaded() {
+    if (this.userDataLoaded) return
+    this.userDataLoaded = true
+    this._broadcastReceive({ kind: 'userdata-loaded' })
+  },
+
+  // 挂 interconnect 接收单例。feature 不可用(canIUse false)静默跳过。
+  _setupInterconnect() {
+    const canUse = app.canIUse('@system.interconnect')
+    if (!canUse) {
+      console.log('interconnect feature 不可用,跳过接收')
+      return
+    }
+    let connect
+    try {
+      connect = interconnect.instance()
+    } catch (e) {
+      console.log('interconnect.instance FAIL ' + e)
+      return
+    }
+    this.interconnect = connect
+
+    // 接收:按 tag 分发,兼容已验通的裸知识点 JSON 直推(无 tag 字段)。
+    //   "__hs__" → 握手应答 + 心跳保活(第 7 章)
+    //   "file"   → 分片重组状态机(第 8 章)
+    //   无 tag / 其它 → 回退现有 receiveImportedJSON(真接收/自验走这,协议保持不变)
+    // 手机端发的都是 JSON 字符串(见 JsonFilePusher 各消息体),手环 onmessage 收到 data.data(String)。
+    connect.onmessage = (data) => {
+      const s = (data && data.data) || ''
+      if (!s) {
+        console.log('onmessage empty')
+        this._broadcastReceive({ kind: 'empty' })
+        return
+      }
+      // 先尝试当成信封 parse 取 tag;取不到 tag 视为裸知识点 JSON 走兼容路径(不破坏现有链路)。
+      let envelope = null
+      try {
+        envelope = JSON.parse(s)
+      } catch (e) {
+        // 非法 JSON 也交给 receiveImportedJSON 统一兜底(它会返回 parse-fail)
+        this._dispatchRawImport(s, s.length)
+        return
+      }
+      if (envelope && typeof envelope === 'object' && typeof envelope.tag === 'string') {
+        if (envelope.tag === HS_TAG) {
+          this._handleHsMessage(envelope)
+        } else if (envelope.tag === 'file') {
+          this._processFileMessage(envelope)
+        } else if (envelope.tag === 'chat') {
+          this._processChatMessage(envelope)
+        } else {
+          console.log('onmessage unknown tag: ' + envelope.tag)
+        }
+      } else {
+        // 裸知识点 JSON(无 tag 信封):走已验通的导入直推
+        this._dispatchRawImport(s, s.length)
+      }
+    }
+    connect.onerror = (d) => {
+      console.log('interconnect onerror code=' + (d && d.code) + ' data=' + (d && d.data))
+      this._hsCleanup()
+    }
+    // 不打印 onopen/onclose,生产环境无需噪声。
+  },
+
+  // 裸知识点 JSON 直推:与重构前 onmessage 行为完全一致(parse+merge+落盘+广播)。
+  // __hs__/file 两条新链路各自的落盘在各自处理函数内完成,不经过这里。
+  _dispatchRawImport(jsonStr, len) {
+    const r = this.receiveImportedJSON(jsonStr)
+    console.log('onmessage raw ' + (r.ok ? 'ok' : r.reason) + ' len=' + len)
+  },
+
+  // 手环→手机 发送封装:统一走 connect.send({data:Object})(官方 API,见 vela开发文档.md:2981)。
+  // 注意:文档配套开发文档第 7、8 章示例写的 this.interconnect.sendMessage(...) 是误抄手机端
+  // MessageApi.sendMessage 的写法,手环端无此方法,正确是 connect.send({data:<Object>})。
+  // 框架自动把 Object 序列化为 JSON 字符串发给手机端,手机端 decodeToString + JSON.parse 可还原。
+  _sendToPhone(obj) {
+    if (!this.interconnect || !this.interconnect.send) return
+    try {
+      this.interconnect.send({ data: obj })
+    } catch (e) {
+      console.log('interconnect.send FAIL ' + e)
+    }
+  },
+
+  // ====== 第 7 章: __hs__ 握手应答 + 心跳保活 ======
+  // 三方来回:手机发 count=0 → 手环回 count=1(带本端版本) → 手机回 count=2 → 握手成,启心跳。
+  // count<3 时持续应答(手机对端也会回 count+1),用于心跳往返保活。
+  _handleHsMessage(msg) {
+    // 收到任何有效握手包即清超时(链路活着,重新等下一条)
+    if (this.hsTimeoutTimer) {
+      clearTimeout(this.hsTimeoutTimer)
+      this.hsTimeoutTimer = null
+    }
+    if (typeof msg.count !== 'number') return
+    if (msg.count === 0) {
+      // 手机端首发握手:回 count=1 带本端版本号,并启动握手超时(等 count=2)
+      this._sendToPhone({ tag: HS_TAG, count: 1, version: BAND_VERSION_CODE })
+      this._startHsTimeout()
+    } else if (msg.count === 1) {
+      // 手机端回我们的 count=1(实际握手由手机主导,此分支为对端重发场景兜底)
+      this._sendToPhone({ tag: HS_TAG, count: 2 })
+      this._hsHandshakeDone()
+    } else if (msg.count >= 2) {
+      // count>=2:握手已成的后续保活包,刷新心跳
+      this._startHeartbeat()
+    }
+  },
+  // 握手成功:清超时,启心跳
+  _hsHandshakeDone() {
+    if (this.hsTimeoutTimer) {
+      clearTimeout(this.hsTimeoutTimer)
+      this.hsTimeoutTimer = null
+    }
+    this._startHeartbeat()
+    console.log('hs handshake done')
+  },
+  // 握手超时(发完 count=1 后 HS_TIMEOUT_MS 内未收到 count>=2)
+  _startHsTimeout() {
+    if (this.hsTimeoutTimer) clearTimeout(this.hsTimeoutTimer)
+    this.hsTimeoutTimer = setTimeout(() => {
+      console.log('hs timeout: no count>=2')
+      this._hsCleanup()
+    }, HS_TIMEOUT_MS)
+  },
+  // 心跳:周期性发 count=0,手机端收到后会回 count=1,再触 _handleHsMessage → 刷新心跳,链路活。
+  _startHeartbeat() {
+    if (this.hbTimer) clearTimeout(this.hbTimer)
+    this.hbTimer = setInterval(() => {
+      this._sendToPhone({ tag: HS_TAG, count: 0, version: BAND_VERSION_CODE })
+    }, HEARTBEAT_INTERVAL_MS)
+  },
+  _hsCleanup() {
+    if (this.hsTimeoutTimer) {
+      clearTimeout(this.hsTimeoutTimer)
+      this.hsTimeoutTimer = null
+    }
+    if (this.hbTimer) {
+      clearInterval(this.hbTimer)
+      this.hbTimer = null
+    }
+  },
+
+  // ====== 第 8 章: file tag 分片重组状态机 ======
+  // 协议(与手机端 JsonFilePusher.kt 对齐):
+  //   收(手机→手环, 字段 stat): startTransfer / d / transferComplete / cancel
+  //   发(手环→手机, 字段 type):  ready / next_chunk / transfer_finished / error
+  // 注意双端字段名不对称:手机→手环用 stat,手环→手机用 type(直接沿用弦电子书协议,
+  // 手机端 FileMessagesFromDevice.Header 认 type, FileMessagesToSend 各消息认 stat)。
+  // 流程: startTransfer→回ready(nextChunkIndex:0) → d[i]→追加缓冲→回next_chunk → ... →
+  //       手机发完最后一片后发 transferComplete → 手环组装+并入+落盘 → 回 transfer_finished。
+  _newFileState() {
+    return {
+      buffer: {},          // chunkIndex → 已收内容(用对象当 Map,idx 作 key)
+      totalChunks: 0,
+      fileName: '',
+      totalBytes: 0,
+      receivedChunks: 0,    // 已收片数(判齐)
+      isReceiving: false
+    }
+  },
+  _processFileMessage(msg) {
+    if (!msg || typeof msg.stat !== 'string') return
+    switch (msg.stat) {
+      case 'startTransfer': {
+        // 首包:重置状态机,回 ready 期待 index 0
+        this.fileState = this._newFileState()
+        this.fileState.totalChunks = (typeof msg.totalChunks === 'number' && msg.totalChunks > 0) ? msg.totalChunks : 0
+        this.fileState.fileName = (typeof msg.filename === 'string') ? msg.filename : 'unknown.json'
+        this.fileState.totalBytes = (typeof msg.totalBytes === 'number') ? msg.totalBytes : 0
+        this.fileState.isReceiving = true
+        console.log('file transfer start: ' + this.fileState.fileName + ' ' + this.fileState.totalBytes + 'B ' + this.fileState.totalChunks + ' chunks')
+        this._sendToPhone({ tag: 'file', type: 'ready', nextChunkIndex: 0 })
+        break
+      }
+      case 'd': {
+        // 数据分片:追加缓冲,回 next_chunk 让手机端发下一片
+        const st = this.fileState
+        if (!st || !st.isReceiving) {
+          this._sendToPhone({ tag: 'file', type: 'error', message: 'not receiving' })
+          return
+        }
+        const idx = msg.chunkIndex
+        const data = msg.data
+        if (typeof idx !== 'number' || typeof data !== 'string') {
+          this._sendToPhone({ tag: 'file', type: 'error', message: 'bad chunk fields' })
+          return
+        }
+        if (st.buffer[idx] === undefined) {
+          st.buffer[idx] = data
+          st.receivedChunks++
+        } else {
+          // 重复片(手机端重发),覆盖即可,不重复计数
+          st.buffer[idx] = data
+        }
+        console.log('file chunk ' + idx + '/' + (st.totalChunks - 1) + ' received ' + data.length + 'B')
+        this._sendToPhone({ tag: 'file', type: 'next_chunk' })
+        break
+      }
+      case 'transferComplete': {
+        // 手机端确认发完:此时片应已齐,组装并入落盘,回 transfer_finished 触发手机端 onSuccess
+        this._finishFileTransfer()
+        break
+      }
+      case 'get_storage_info': {
+        // 手机端请求查询手环存储空间。回 storage_info 让手机端首页圆环显示已用占比。
+        // 协议(手环→手机, type 字段): storage_info + product/totalStorage/availableStorage/
+        // reservedStorage/usedStorage/actualAvailable。数字为 Byte,product 字符串可空。
+        // 字段对齐手机端 JsonFilePusher.handleStorageInfo,缺字段由 BandStorageInfoData 默认值 0 兜住。
+        this._reportStorageInfoToDevice()
+        break
+      }
+      case 'cancel': {
+        // 用户取消:丢弃缓冲,重置
+        console.log('file transfer cancelled by phone')
+        this.fileState = null
+        break
+      }
+      default:
+        console.log('file unknown stat: ' + msg.stat)
+        break
+    }
+  },
+  // 收齐判定 + 组装并入落盘 + 回 transfer_finished。
+  // 在 transferComplete 锚点 finalize(手机端只有发完所有片才发此包,片必然已齐)。
+  _finishFileTransfer() {
+    const st = this.fileState
+    if (!st || !st.isReceiving) {
+      this._sendToPhone({ tag: 'file', type: 'error', message: 'finish without state' })
+      return
+    }
+    // 片齐判定:0..totalChunks-1 每个索引都有内容
+    if (st.totalChunks <= 0 || st.receivedChunks < st.totalChunks) {
+      // 还没收齐(异常:手机端提前发完包或丢片)。回 error,等手机端重发。
+      this._sendToPhone({ tag: 'file', type: 'error', message: 'chunks incomplete ' + st.receivedChunks + '/' + st.totalChunks })
+      return
+    }
+    // 按 index 升序组装完整 JSON
+    let fullJson = ''
+    for (let i = 0; i < st.totalChunks; i++) {
+      fullJson += st.buffer[i] != null ? st.buffer[i] : ''
+    }
+    // 重置状态(先清释放内存,再用本地副本落盘)
+    this.fileState = null
+    // 并入 + 落盘(与 receiveImportedJSON 同一条 mergeParsedInto + _persistCurrentUserData)
+    let ok = false, reason = ''
+    try {
+      const parsed = JSON.parse(fullJson)
+      knowledgeStore.mergeParsedInto(parsed)
+      const persistResult = this._persistCurrentUserData()
+      ok = persistResult.ok
+      if (!ok) reason = 'persist ' + (persistResult.code || 'fail')
+      console.log('file transfer completed: ' + fullJson.length + 'B persisted=' + ok)
+    } catch (e) {
+      reason = 'parse/merge fail'
+      console.log('file transfer finalize fail: ' + e)
+    }
+    // 回执手机端:并入内存即算成功(persist 异步乐观结论由 _persistCurrentUserData 给)
+    if (ok) {
+      this._sendToPhone({ tag: 'file', type: 'transfer_finished' })
+      this._broadcastReceive({ kind: 'imported', len: fullJson.length, persisted: true })
+    } else {
+      this._sendToPhone({ tag: 'file', type: 'error', message: reason })
+    }
+  },
+
+  // ====== 第 9 章: get_storage_info 存储查询应答 ======
+  // 手机端发 {tag:'file', stat:'get_storage_info'},手环回 {tag:'file', type:'storage_info', ...}。
+  // 字段全为 Byte(product 除外,字符串可空)。
+  //
+  // 实现照搬参考工程 com.bandbbs.ebook/src/utils/interconnfile.js:896 的 getStorageInfo():
+  // 串行 await getInfo → getTotalStorage → getAvailableStorage,每步用 _promiseVela 包 Promise,
+  // 失败退化取 0;外层 2.5s setTimeout 兜底——某些机型 device.getTotalStorage/getAvailableStorage
+  // 静默不回调(success/fail/complete 都不触发),并发计数方案会永远 pending 只能等超时回 0,
+  // 串行 + 兜底超时保证最终必回包。reservedStorage 按机型 product 查表(_reservedStorageByProduct)。
+  _reportStorageInfoToDevice() {
+    let done = false
+    const finish = (info) => {
+      if (done) return
+      done = true
+      this._sendToPhone(Object.assign({ tag: 'file', type: 'storage_info' }, info))
+    }
+    // 2.5s 硬超时:任意一步静默不回调也强制回 0 兜底(手机端 hasValidData 判 false,保留上次有效值)
+    const timer = setTimeout(() => {
+      finish({ product: null, totalStorage: 0, availableStorage: 0, reservedStorage: 0, usedStorage: 0, actualAvailable: 0 })
+    }, 2500)
+
+    ;(async () => {
+      let product = null
+      let totalStorage = 0
+      let availableStorage = 0
+      try { const d = await this._promiseVela(device.getInfo); product = (d && (d.product || d.model)) || null } catch (e) {}
+      try { const d = await this._promiseVela(device.getTotalStorage); totalStorage = Number(d && d.totalStorage) || 0 } catch (e) {}
+      try { const d = await this._promiseVela(device.getAvailableStorage); availableStorage = Number(d && d.availableStorage) || 0 } catch (e) {}
+
+      clearTimeout(timer)
+      const reservedStorage = this._reservedStorageByProduct(product)
+      const usedStorage = Math.max(0, totalStorage - availableStorage)
+      const actualAvailable = Math.max(0, totalStorage - reservedStorage - usedStorage)
+      finish({ product, totalStorage, availableStorage, reservedStorage, usedStorage, actualAvailable })
+    })()
+  },
+  // 把 Vela 回调式 API(仅需 success/fail 两参那种)包成可 await 的 Promise。
+  // 失败直接 reject,外层 try/catch 兜为「该 API 不支持 → 该值取 0」。
+  // 等价参考工程 com.bandbbs.ebook/src/utils/interconnfile.js 的 runAsyncFunc。
+  _promiseVela(fn, params) {
+    return new Promise((resolve, reject) => {
+      try {
+        if (typeof fn !== 'function') { reject(new Error('no api')); return }
+        fn({ ...(params || {}), success: resolve, fail: (d, code) => reject(new Error('code=' + code)) })
+      } catch (e) { reject(e) }
+    })
+  },
+  // 机型预留存储查表:与 com.bandbbs.ebook/src/utils/storageUtils.js getReservedStorage 对齐。
+  // 不在表内的机型返回 0(actualAvailable 退化为 = available 语义)。
+  _reservedStorageByProduct(product) {
+    if (!product) return 0
+    if (product === 'REDMI Watch 6') return 120 * 1024 * 1024
+    if (product === 'REDMI Watch 5') return 120 * 1024 * 1024
+    if (product === 'Xiaomi Smart Band 9') return 64 * 1024 * 1024
+    if (product === 'Xiaomi Smart Band 9 Pro') return 64 * 1024 * 1024
+    if (product === 'Xiaomi Smart Band 8 Pro') return 84 * 1024 * 1024
+    if (product === 'o65m') return 1024 * 1024 * 1024
+    if (product.indexOf('Xiaomi Smart Band 10') >= 0) return 90 * 1024 * 1024
+    return 0
+  },
+
+  // ====== 第 10 章: chat tag AI 聊天助手 Amadeus ======
+  // 协议(与手机端配套 md 对齐):
+  //   发(手环→手机, 字段 type): chat_request / chat_new / chat_history_request(本期不接)
+  //   收(手机→手环, tag='chat' + stat):
+  //     reply_start / reply_chunk / reply_end / reply_error / chat_new_ack
+  // 上下文在手机端按 sessionId 维护,手环端只存本轮 sessionId、不存历史、不持久化。
+  // 流控与 file 同款(单 BLE 通道并发下发会被吞):每收一 chunk 回 reply_ack,手机端等 ack 再发下一片。
+  // 回复一次性拼齐(收齐 reply_end 才把完整文本一次入列,不逐片渐进,避免手环 DOM 频刷抖动)。
+  // 发 chat_request 后起 15s watchdog,收 reply_start/end/error 任一即清,超时广播 timeout(兜未对接安卓端)。
+
+  // 页面订阅 chat 事件。返回 unsubscribe 函数(同 onReceive 范式)。
+  // evt 形如 {kind:'reply_start'|'reply_end'|'reply_error'|'new_session'|'timeout', sessionId?, fullText?, message?}
+  onChat(cb) {
+    if (typeof cb !== 'function') return () => {}
+    this.chatListeners.push(cb)
+    return () => {
+      const i = this.chatListeners.indexOf(cb)
+      if (i >= 0) this.chatListeners.splice(i, 1)
+    }
+  },
+  _broadcastChat(evt) {
+    const list = this.chatListeners
+    for (let i = 0; i < list.length; i++) {
+      try { list[i](evt) } catch (e) { /* 单个监听者异常不影响其余 */ }
+    }
+  },
+  // 开新会话:生成 sessionId 并发 chat_new 让手机端清该 session 历史。返回 sessionId。
+  // sessionId 用 Date.now()+Math.random 串,双端一致即可(手机端采用手环发来的)。
+  startNewChatSession() {
+    const sid = 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+    this.chatSession = { sessionId: sid }
+    this._sendToPhone({ type: 'chat_new', sessionId: sid })
+    return sid
+  },
+  // 发一轮对话:取当前 sessionId(无则先开新会话),发 chat_request 给手机端。
+  // 同时起 15s watchdog,收不到任何 reply_* 即超时广播(页面显"手机端未响应")。
+  sendChatMessage(text) {
+    if (!text) return
+    let sid = this.chatSession && this.chatSession.sessionId
+    if (!sid) {
+      // 无会话:自动开新会话(顺带发了 chat_new),用其返回的 sid 发 chat_request
+      sid = this.startNewChatSession()
+    }
+    this._armChatWatchdog()
+    this._sendToPhone({ type: 'chat_request', sessionId: sid, text: text })
+  },
+  // 15s 超时定时器:发 chat_request 时起,reply_start/reply_end/reply_error 任一到达即清。
+  // 超时则清 chatReplyState、广播 timeout(页面脱"回答中"并显提示)。
+  _armChatWatchdog() {
+    if (this.chatWatchdog) clearTimeout(this.chatWatchdog)
+    this.chatWatchdog = setTimeout(() => {
+      this.chatWatchdog = null
+      this.chatReplyState = null
+      this._broadcastChat({ kind: 'timeout' })
+    }, 15000)
+  },
+  _clearChatWatchdog() {
+    if (this.chatWatchdog) { clearTimeout(this.chatWatchdog); this.chatWatchdog = null }
+  },
+  // 收 chat 信封分发(手机→手环,按 stat)。
+  _processChatMessage(msg) {
+    if (!msg || typeof msg.stat !== 'string') return
+    switch (msg.stat) {
+      case 'reply_start': {
+        // 回复开始:初始化分片重组状态机,清 watchdog(链路活了),广播让页面置"回答中"
+        this.chatReplyState = {
+          buffer: {},
+          totalChunks: (typeof msg.totalChunks === 'number' && msg.totalChunks > 0) ? msg.totalChunks : 0,
+          received: 0,
+          sessionId: (typeof msg.sessionId === 'string') ? msg.sessionId : (this.chatSession && this.chatSession.sessionId) || ''
+        }
+        this._clearChatWatchdog()
+        this._broadcastChat({ kind: 'reply_start', sessionId: this.chatReplyState.sessionId })
+        break
+      }
+      case 'reply_chunk': {
+        // 一片文本:追加缓冲,回 reply_ack 让手机端发下一片(流控,同 file)
+        const st = this.chatReplyState
+        if (!st) {
+          this._sendToPhone({ type: 'reply_ack', ok: false, reason: 'not receiving' })
+          return
+        }
+        const idx = msg.chunkIndex
+        const data = msg.data
+        if (typeof idx !== 'number' || typeof data !== 'string') {
+          this._sendToPhone({ type: 'reply_ack', ok: false, reason: 'bad chunk' })
+          return
+        }
+        if (st.buffer[idx] === undefined) {
+          st.buffer[idx] = data
+          st.received++
+        } else {
+          st.buffer[idx] = data
+        }
+        this._sendToPhone({ type: 'reply_ack', ok: true, chunkIndex: idx })
+        break
+      }
+      case 'reply_end': {
+        // 全部到齐:收到 reply_end 即手机端显式结束,只校验收到过内容(不校验 received vs totalChunks)。
+        // totalChunks 语义改为最大片数上限(手机端 SSE 流式传保守值即可),遍历用 (totalChunks || received)。
+        // 空洞跳过(允许中途 resume 补片),与 file 分片组装思路一致。
+        this._clearChatWatchdog()
+        const st = this.chatReplyState
+        this.chatReplyState = null
+        if (!st || st.received <= 0) {
+          this._broadcastChat({ kind: 'reply_error', message: '回复不完整 ' + (st ? st.received + '片' : 'no-state') })
+          return
+        }
+        let full = ''
+        for (let i = 0; i < (st.totalChunks || st.received); i++) {
+          full += (st.buffer[i] != null) ? st.buffer[i] : ''
+        }
+        this._broadcastChat({ kind: 'reply_end', sessionId: st.sessionId, fullText: full })
+        break
+      }
+      case 'reply_error': {
+        // 手机端 LLM 调用失败/超时:清 watchdog/状态,广播 error
+        this._clearChatWatchdog()
+        this.chatReplyState = null
+        this._broadcastChat({ kind: 'reply_error', message: (typeof msg.message === 'string') ? msg.message : '手机端错误' })
+        break
+      }
+      case 'chat_new_ack': {
+        // 手机端确认新会话(若自生 sessionId 则在此回传,手环据此校正本地)
+        if (typeof msg.sessionId === 'string' && msg.sessionId) {
+          this.chatSession = { sessionId: msg.sessionId }
+          this._broadcastChat({ kind: 'new_session', sessionId: msg.sessionId })
+        }
+        break
+      }
+      default:
+        console.log('chat unknown stat: ' + msg.stat)
+        break
+    }
+  },
+
+  // merge 进来的新条目并入既有用户数据后,把整体 stringify 写回;下次启动读回 setUserData 重放。
+  // 无 file feature 静默跳过(内存态新科目本进程仍可用,只是重启后不在)。
+  // 返回 {ok:boolean, code?:number} 让 receiveImportedJSON 能把落盘结论传给调用方/日志订阅者。
+  _persistCurrentUserData() {
+    if (!app.canIUse('@system.file')) return { ok: false, code: 'no-feature' }
+    const jsonStr = knowledgeStore.getUserDataJSON()
+    if (!jsonStr) {
+      console.log('persist skip: no user data')
+      return { ok: false, code: 'no-data' }
+    }
+    file.writeText({
+      uri: USER_DATA_URI,
+      text: jsonStr,
+      success: () => { console.log('user data persisted to file') },
+      fail: (er) => { console.log('persist FAIL code=' + (er && er.code)) }
+    })
+    // file.writeText 异步,这里无法同步拿到 success/fail;返回乐观结论"已派发写"。
+    // 真实成败由 success/fail 回调记 console;广播里的 persisted 取乐观值。
+    return { ok: true }
+  }
+}
+</script>

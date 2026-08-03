@@ -5,3 +5,27 @@
 /dist
 /build
 .husky/
+手机端存储查询实现说明.md
+_formulas_dump.json
+.eslintignore
+.npmignore
+.prettierrc.js
+.stylelintrc.js
+闪念小抄_安卓配套App_开发流程_全记录.md
+手环端存储查询协议实现 copy.md
+手环端存储查询协议实现.md
+手机端AI聊天适配说明.md
+拓展内容.md
+知识点JSON文件格式.md
+Amadeus_logo.png
+husky.sh
+jsconfig.json
+vela开发文档.md
+scripts/gen_all_fixed.js
+scripts/gen_all_fixed2.js
+scripts/gen_all.js
+scripts/gen_formulas.js
+scripts/gen_logo.py
+scripts/gen_prose_check.js
+scripts/generate_prose.js
+src/config-watch.json

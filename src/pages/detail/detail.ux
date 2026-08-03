@@ -1,0 +1,290 @@
+<template>
+  <div class="container">
+    <!-- 返回按钮 -->
+    <img
+      class="leftButton top"
+      src="/common/images/back.png"
+      @click="goBack"
+      static
+    />
+    <!-- 时间 -->
+    <text class="time">{{ currentTime }}</text>
+    <!-- 标题 -->
+    <text class="title" static>
+      <span>关于</span>
+    </text>
+
+    <div style="height: 6px;"></div>
+
+    <!-- 加载占位（首帧先就位） -->
+    <div class="content-loading" if="{{!loaded}}">
+      <text class="content-loading__text" static>加载中...</text>
+    </div>
+
+    <!-- 滚动容器 -->
+    <div class="box" if="{{loaded}}">
+      <scroll class="box" scroll-x="false" scroll-y="true" bounces="true">
+        <!-- 内容卡片 -->
+        <div class="detail-item">
+          <div class="detail-card">
+            <text class="detail-title">闪念小抄</text>
+            <text class="detail-version">版本 1.0.0</text>
+            <text class="detail-desc">高中知识点速记工具</text>
+            <text class="detail-desc">随时随地，轻松学习</text>
+
+            <text class="detail-slogan">「闪念之间，知识即现」</text>
+
+            <div class="detail-divider"></div>
+
+            <div class="detail-developer-row">
+              <img src="/common/images/avatar.png" class="detail-avatar" />
+              <text class="detail-developer">开发者 @文华逸洋</text>
+            </div>
+
+            <div class="detail-divider detail-divider--thin"></div>
+
+            <!-- 导入知识点入口:interconnect 接收页(真接收手机端推送 + 本地自验) -->
+            <div class="detail-extra" @click="goImport">
+              <text class="detail-extra__title">导入知识点</text>
+              <text class="detail-extra__hint">手机端推送 / 本地自验导入</text>
+            </div>
+          </div>
+        </div>
+
+        <!-- 底部占位 -->
+        <div class="padding"></div>
+      </scroll>
+    </div>
+  </div>
+</template>
+
+<script>
+import router from '@system.router'
+import prompt from '@system.prompt'
+import { onTimeChange, offTimeChange } from '../../common/clock'
+
+export default {
+  private: {
+    loaded: false,
+    currentTime: "00:00"
+  },
+
+  onInit() {
+    this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
+    // 内容是单张静态卡,数据无;loaded=false 让 scroll 不进 DOM,首帧只画标题+占位。
+    // 50ms 后切 loaded=true 渲染卡片,让标题先就位,进页顺滑。
+    setTimeout(() => {
+      this.loaded = true
+    }, 50)
+  },
+
+  onDestroy() {
+    if (this.__unsubClock) {
+      offTimeChange(this.__unsubClock)
+    }
+  },
+
+  goBack() {
+    router.back()
+  },
+
+  // 跳转导入页:interconnect 接收 + 本地自验都在那页。
+  goImport() {
+    router.push({ uri: '/pages/import' })
+  },
+
+  // 加载预制示例扩展包 sample（走 import .js 路线，详见 knowledgeStore.js 注释）。
+  // store.loadExtraByName 同步把包并入 $app.$def.store 的 userSubjects；
+  // 成功后返回 index，onShow 重读 getSubjects 即可看到「拓展物理」置底带「导入」角标。
+  loadExtraSample() {
+    prompt.showToast({ message: '加载中...', duration: 800 })
+    this.$app.$def.store.loadExtraByName('sample', (res) => {
+      if (res && res.ok) {
+        prompt.showToast({ message: '已加载示例扩展包', duration: 1500 })
+        return
+      }
+      const reason = (res && res.reason) ? res.reason : 'fail'
+      let msg = '加载失败:' + reason
+      if (reason === 'no-reg') msg = '示例包未注册'
+      prompt.showToast({ message: msg, duration: 2000 })
+    })
+  }
+}
+</script>
+
+<style>
+@import '../../common/style.css';
+
+.container {
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: center;
+  background-color: #0A0A0C;
+  height: 100%;
+  width: 100%;
+  padding: 8px 0;
+}
+
+.title {
+  position: relative;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 32px;
+  font-weight: bold;
+  color: #FFFFFF;
+}
+
+.time {
+  position: relative;
+  top: 4px;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 22px;
+  font-weight: bold;
+  color: rgba(255,255,255,0.5);
+}
+
+.leftButton {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  width: 72px;
+  height: 72px;
+}
+
+.box {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+}
+
+.content-loading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  width: 100%;
+}
+
+.content-loading__text {
+  color: #98989E;
+  font-size: 24px;
+}
+
+.padding {
+  height: 90px;
+}
+
+/* ---------- 详情页专属样式 ---------- */
+.detail-item {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  min-height: 380px;
+  background-color: transparent;
+  padding: 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.detail-card {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  background-color: #18181A;
+  border-radius: 18px;
+  padding: 20px 20px;
+  border: 1px solid #2A2A2E;
+}
+
+.detail-title {
+  color: #FFFFFF;
+  font-size: 36px;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+
+.detail-version {
+  color: #98989E;
+  font-size: 22px;
+  margin-bottom: 12px;
+}
+
+.detail-desc {
+  color: #98989E;
+  font-size: 24px;
+  line-height: 36px;
+  text-align: center;
+}
+
+.detail-slogan {
+  color: #7899BB;
+  font-size: 22px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  margin-top: 6px;
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+.detail-divider {
+  width: 60%;
+  height: 1px;
+  background-color: #2A2A2E;
+  margin: 10px 0 12px 0;
+}
+
+.detail-divider--thin {
+  width: 100%;
+  margin: 14px 0 8px 0;
+}
+
+/* ---------- 拓展知识点入口 ---------- */
+.detail-extra {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 10px 0;
+  margin-top: 2px;
+}
+
+.detail-extra__title {
+  color: #7899BB;
+  font-size: 24px;
+  font-weight: bold;
+}
+
+.detail-extra__hint {
+  color: #98989E;
+  font-size: 20px;
+  margin-top: 4px;
+}
+
+.detail-developer-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.detail-avatar {
+  width: 56px;
+  height: 56px;
+  border-radius: 25%;
+  border: 1px solid #2A2A2E;
+  flex-shrink: 0;
+  margin-right: 12px;
+}
+
+.detail-developer {
+  color: #7899BB;
+  font-size: 22px;
+  letter-spacing: 0.5px;
+}
+
+</style>

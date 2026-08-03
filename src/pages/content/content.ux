@@ -1,0 +1,673 @@
+<template>
+  <div class="container">
+    <!-- 返回按钮 -->
+    <img
+      class="leftButton top"
+      src="/common/images/back.png"
+      @click="goBack"
+      static
+    />
+    <!-- 时间 -->
+    <text class="time">{{ currentTime }}</text>
+    <!-- 标题 -->
+    <text class="title" static>
+      <span>知识点</span>
+    </text>
+
+    <div style="height: 6px;"></div>
+
+    <!-- 加载占位（首帧先就位，避免进页瞬间渲染长原文/多要点卡顿） -->
+    <div class="content-loading" if="{{!loaded}}">
+      <text class="content-loading__text" static>加载中...</text>
+    </div>
+
+    <!-- 滚动容器 -->
+    <div class="box" if="{{loaded}}">
+      <scroll id="contentScroll" class="box" scroll-x="false" scroll-y="true" bounces="true">
+        <!-- 知识点头部 -->
+        <div class="content-header">
+          <div class="content-subject">
+            <text class="content-subject__text">{{ subjectName }}</text>
+          </div>
+          <text class="content-title">{{ title }}</text>
+          <text class="content-desc" if="{{desc}}">{{ desc }}</text>
+          <div class="content-divider"></div>
+        </div>
+
+        <!-- 原文（特殊标注）：按字数分页，滚动过程中 DOM 数量固定，避免超长原文越往后越卡 -->
+        <div class="content-raw" if="{{raw}}">
+          <text class="content-raw__label" static>原文</text>
+          <div class="content-raw__loading" if="{{rawPageLoading}}">
+            <text class="content-raw__loading-text" static>加载中...</text>
+          </div>
+          <div class="content-raw__paragraphs" if="{{!rawPageLoading}}">
+            <text class="content-raw__para" for="{{visibleRawParagraphs}}">{{ $item }}</text>
+          </div>
+          <div class="content-raw__pager" if="{{rawTotalPages > 1}}">
+            <div class="content-raw__pager-btn {{ rawPage <= 1 ? 'content-raw__pager-btn--disabled' : '' }}" @click="prevRawPage">
+              <text class="content-raw__pager-text">上一页</text>
+            </div>
+            <text class="content-raw__pager-info">第 {{ rawPage }} / {{ rawTotalPages }} 页</text>
+            <div class="content-raw__pager-btn {{ rawPage >= rawTotalPages ? 'content-raw__pager-btn--disabled' : '' }}" @click="nextRawPage">
+              <text class="content-raw__pager-text">下一页</text>
+            </div>
+          </div>
+        </div>
+
+        <!-- 要点列表 -->
+        <div class="content-point" for="{{points}}" if="{{points.length > 0}}">
+          <div class="content-point__index">
+            <text class="content-point__index-text">{{ $idx + 1 }}</text>
+          </div>
+          <text class="content-point__text">{{ $item }}</text>
+        </div>
+
+        <!-- 公式（预渲染 PNG，知识点正文之后；per-point 一张图，宽度满铺高度自适应） -->
+        <div class="content-formula" if="{{formulaImg}}">
+          <text class="content-formula__label" static>公式</text>
+          <img class="content-formula__img" src="{{ formulaImg }}" @click="zoomOpen" />
+        </div>
+
+        <!-- 空状态 -->
+        <div class="content-empty" if="{{points.length === 0 && !raw}}">
+          <text class="content-empty__text" static>暂无内容</text>
+        </div>
+
+        <!-- 底部占位 -->
+        <div class="padding"></div>
+      </scroll>
+    </div>
+
+    <!-- 公式大图弹层：点公式图打开，全屏黑底，档位缩放 + 自由拖拽 -->
+    <div class="formula-zoom" if="{{zoomShow}}">
+      <text class="formula-zoom__hint">{{ zoomHint }}</text>
+      <!-- 自由拖拽区:touchstart/move/end 手动跟手 translate(替代 scroll 的固定方向滚动) -->
+      <!-- 切档只走双击(zoomClick 内自实现 300ms 判定),不绑 longpress —— 真机拖动时手指稍停会触发
+           longpress 偷切档,与拖拽行为冲突。 -->
+      <div class="formula-zoom__pad"
+           @touchstart="zoomTouchStart"
+           @touchmove="zoomTouchMove"
+           @touchend="zoomTouchEnd"
+           @click="zoomClick">
+        <img class="formula-zoom__img"
+             src="{{ zoomSrc }}"
+             style="width:{{ zoomW }}px; height:{{ zoomH }}px; transform:{{ zoomTransform }};" />
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+import router from '@system.router'
+import { onTimeChange, offTimeChange } from '../../common/clock'
+
+export default {
+  protected: {
+    subjectName: '',
+    title: ''
+  },
+  private: {
+    desc: '',
+    raw: '',
+    points: [],
+    formulaImg: '',
+    formulaW: 0,
+    formulaH: 0,
+    loaded: false,
+    currentTime: "00:00",
+    // 原文段落数组（由 raw 按 \n 切分）；按字数分页，滚动时 DOM 数量固定，避免超长原文越往后越卡
+    rawParagraphs: [],
+    visibleRawParagraphs: [],
+    rawPage: 1,
+    rawTotalPages: 1,
+    rawPageCharLimit: 400,   // 每页字数上限（按段累加，不满一段不拆段）
+    rawPageLoading: false,   // 翻页时短暂显示「加载中」占位，缓解切页卡顿
+    // 公式大图弹层状态
+    zoomShow: false,
+    zoomScale: 1,        // 档位 1/2/3
+    zoomSrc: '',        // 沿用原图,各档不切 src
+    zoomW: 288,         // 当前档位像素宽
+    zoomH: 0,           // 当前档位像素高
+    zoomHint: '1x · 单击收起 · 双击/长按切档 · 拖动看全',  // 提示文字预拼(Vela 紧跟字母插值不稳)
+    zoomTransform: 'translate(0px, 0px)',  // 拖拽位移(JSON.stringify 形式见 _zoomTrans)
+    zoomLastTap: 0,     // 上次 click 时间戳(双击判定)
+    zoomTapTimer: null, // 单击延迟 timer(300ms 内无第二次则收起)
+    // 自由拖拽位移状态(跟手 translate,替代 scroll 单向滚动)
+    zoomTx: 0,          // 当前累计位移 X
+    zoomTy: 0,          // 当前累计位移 Y
+    zoomStartTx: 0,     // 本次 touch 起始时的累计位移
+    zoomStartTy: 0,
+    zoomStartX: 0,      // 本次 touch 起始时手指坐标
+    zoomStartY: 0,
+    zoomMoved: false    // 本次 touch 是否发生移动(区分点击 vs 拖动)
+  },
+  onInit() {
+    const subject = this.subjectName || ''
+    const title = this.title || ''
+    this.subjectName = subject
+    this.title = title
+    // 数据立即准备好(单次 find,轻),但 loaded=false 让 scroll 不进 DOM,首帧只画「加载中」占位。
+    // 50ms 后再切 loaded=true 渲染 scroll(含长原文/多要点),让标题与背景先就位,避免进页瞬间卡顿。
+    const list = this.$app.$def.store.getKnowledge(subject)
+    const item = list.find(k => k.title === title)
+    this.desc = (item && item.desc) ? item.desc : ''
+    this.raw = (item && item.raw) ? item.raw : ''
+    this.points = (item && item.points) ? item.points : []
+    this.formulaImg = (item && item.formulaImg) ? item.formulaImg : ''
+    this.formulaW = (item && item.formulaW) ? item.formulaW : 0
+    this.formulaH = (item && item.formulaH) ? item.formulaH : 0
+
+    // 预处理原文段落（按换行切分，过滤空段落；原文用单换行 \n 分段，如孔雀东南飞）
+    // 再按字数分页：逐段累加字数，满一页封页，单段超长独占一页也不拆段（避免半句话截断）。
+    if (this.raw) {
+      this.rawParagraphs = this.raw
+        .split(/\n+/)
+        .map(p => p.trim())
+        .filter(p => p.length > 0)
+      this._buildRawPages()
+      this.rawPage = 1
+      this._renderRawPage()
+    }
+
+    this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
+    setTimeout(() => {
+      this.loaded = true
+    }, 50)
+  },
+  onDestroy() {
+    if (this.__unsubClock) {
+      offTimeChange(this.__unsubClock)
+    }
+    if (this.__rawPageTimer) {
+      clearTimeout(this.__rawPageTimer)
+      this.__rawPageTimer = null
+    }
+  },
+  // 按字数把段落切成多页：逐段累加字数，达上限封页；单段超长独占一页（不拆半句）。
+  _buildRawPages() {
+    const paras = this.rawParagraphs
+    const limit = this.rawPageCharLimit
+    const pages = []
+    let start = 0
+    let acc = 0
+    for (let i = 0; i < paras.length; i++) {
+      const len = paras[i].length
+      // 当前页已有内容且加入本段会超限 → 先封页，本段开新页
+      if (acc > 0 && acc + len > limit) {
+        pages.push([start, i])
+        start = i
+        acc = len
+      } else {
+        acc += len
+      }
+    }
+    if (start < paras.length) pages.push([start, paras.length])
+    this.__rawPageRanges = pages.length ? pages : [[0, 0]]
+    this.rawTotalPages = this.__rawPageRanges.length
+  },
+  // 把当前页对应区间的段落塞进 visibleRawParagraphs（同步，翻页用延迟包装）
+  _renderRawPage() {
+    if (!this.__rawPageRanges || this.__rawPageRanges.length === 0) {
+      this.visibleRawParagraphs = []
+      return
+    }
+    const range = this.__rawPageRanges[this.rawPage - 1] || [0, 0]
+    this.visibleRawParagraphs = this.rawParagraphs.slice(range[0], range[1])
+  },
+  // 翻页：点击瞬间在同一帧内同步清空原页 + 切到「加载中」占位 + 滚到顶，
+  // 下一帧再渲染新页内容。做到原页消失和加载中显示之间无中间态。
+  _gotoRawPage(next) {
+    if (next < 1 || next > this.rawTotalPages || next === this.rawPage) return
+    this.rawPage = next
+    this.visibleRawParagraphs = []   // 先清空原页节点
+    this.rawPageLoading = true        // 切到加载中占位
+    this._scrollContentTop()
+    const self = this
+    setTimeout(() => {
+      self._renderRawPage()
+      self.rawPageLoading = false
+      self.__rawPageTimer = null
+    }, 16)
+  },
+  prevRawPage() {
+    if (this.rawPage <= 1) return
+    this._gotoRawPage(this.rawPage - 1)
+  },
+  nextRawPage() {
+    if (this.rawPage >= this.rawTotalPages) return
+    this._gotoRawPage(this.rawPage + 1)
+  },
+  _scrollContentTop() {
+    const sc = this.$element && this.$element('contentScroll')
+    if (!sc || !sc.scrollTo) return
+    sc.scrollTo({ top: 0, left: 0, behavior: 'instant' })
+  },
+  // 拦截侧边右滑返回 / 返回键:弹层开着时,侧滑手势被吞掉(弹层保持不动、不收起、不退页);
+  // 弹层关着时遵循系统逻辑返回上一页。返回 true 表示自己处理(不返回上一页)。
+  onBackPress() {
+    if (this.zoomShow) {
+      return true
+    }
+    return false
+  },
+  goBack() {
+    router.back()
+  },
+  // 点正文公式图 → 打开弹层,初始 1x
+  zoomOpen() {
+    if (!this.formulaImg) return
+    this.zoomSrc = this.formulaImg
+    this.zoomScale = 1
+    this.zoomW = 288
+    this.zoomH = this._zoomHeight(288)
+    this.zoomTx = 0
+    this.zoomTy = 0
+    this.zoomTransform = this._zoomTrans(0, 0)
+    this.zoomHint = this._zoomHint(1)
+    this.zoomLastTap = 0
+    this.zoomMoved = false
+    if (this.zoomTapTimer) { clearTimeout(this.zoomTapTimer); this.zoomTapTimer = null }
+    this.zoomShow = true
+  },
+  // 弹层单击/双击判定:两次 click < 300ms 视为双击 → 切档;单击 → 延迟 300ms 收起
+  // (Vela 无 dblclick,自实现;延迟是为等可能的第二次点击,避免单击立即收起后双击落空)
+  // 发生过拖动(zoomMoved)时跳过,避免拖完图误触发收起
+  zoomClick() {
+    if (this.zoomMoved) { this.zoomMoved = false; return }
+    const now = Date.now()
+    if (this.zoomTapTimer) { clearTimeout(this.zoomTapTimer); this.zoomTapTimer = null }
+    if (this.zoomLastTap && now - this.zoomLastTap < 300) {
+      this.zoomLastTap = 0
+      this.zoomCycle()
+      return
+    }
+    this.zoomLastTap = now
+    this.zoomTapTimer = setTimeout(() => {
+      this.zoomTapTimer = null
+      this.zoomLastTap = 0
+      this.zoomClose()
+    }, 300)
+  },
+  // 收起弹层,复位档位
+  zoomClose() {
+    if (this.zoomTapTimer) { clearTimeout(this.zoomTapTimer); this.zoomTapTimer = null }
+    this.zoomShow = false
+    this.zoomScale = 1
+    this.zoomLastTap = 0
+    this.zoomMoved = false
+  },
+  // 切档 1→2→3→1 循环(双击/长按触发)。切档时位移复位居中,并刷新 hint
+  zoomCycle() {
+    const next = this.zoomScale >= 3 ? 1 : this.zoomScale + 1
+    this.zoomScale = next
+    this.zoomW = 288 * next
+    this.zoomH = this._zoomHeight(this.zoomW)
+    this.zoomTx = 0
+    this.zoomTy = 0
+    this.zoomTransform = this._zoomTrans(0, 0)
+    this.zoomHint = this._zoomHint(next)
+    if (this.zoomTapTimer) { clearTimeout(this.zoomTapTimer); this.zoomTapTimer = null }
+    this.zoomLastTap = 0
+  },
+  // touchstart:记录起始手指坐标和起始累计位移
+  zoomTouchStart(e) {
+    const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0])
+    if (!t) return
+    this.zoomStartX = t.clientX
+    this.zoomStartY = t.clientY
+    this.zoomStartTx = this.zoomTx
+    this.zoomStartTy = this.zoomTy
+    this.zoomMoved = false
+  },
+  // touchmove:跟手平移 —— 累计位移 = 起始位移 + 手指位移,实时刷 transform(自由方向无约束)
+  zoomTouchMove(e) {
+    const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0])
+    if (!t) return
+    const dx = t.clientX - this.zoomStartX
+    const dy = t.clientY - this.zoomStartY
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+      this.zoomMoved = true
+      // 一旦判定为拖动,立即清掉待决的单击 timer/lastTap —— 否则拖动途中 300ms timer 到点会偷关弹层
+      if (this.zoomTapTimer) { clearTimeout(this.zoomTapTimer); this.zoomTapTimer = null }
+      this.zoomLastTap = 0
+    }
+    this.zoomTx = this.zoomStartTx + dx
+    this.zoomTy = this.zoomStartTy + dy
+    this.zoomTransform = this._zoomTrans(this.zoomTx, this.zoomTy)
+  },
+  // touchend:无需回弹,位移保持;click 判定另走 zoomClick
+  zoomTouchEnd() {
+    // 占位:位移保留,不做惯性(真机 Vela 无 inertia 实现,跟手即停已够)
+  },
+  // 按原图宽高比算当前档位像素高(避免拉伸变形)
+  _zoomHeight(w) {
+    if (this.formulaW > 0 && this.formulaH > 0) {
+      return Math.round(this.formulaH * w / this.formulaW)
+    }
+    return 0
+  },
+  // Vela 动态 transform 必须 JSON.stringify 对象(直接 string 不生效,见 vela开发文档.md:10250)
+  _zoomTrans(x, y) {
+    return JSON.stringify({ translateX: Math.round(x) + 'px', translateY: Math.round(y) + 'px' })
+  },
+  // 预拼提示文字(Vela 模板里 number 紧跟字母 x 不稳,改预拼字符串)
+  _zoomHint(scale) {
+    return scale + 'x · 单击收起 · 双击切档 · 拖动看全'
+  }
+}
+</script>
+
+<style>
+@import '../../common/style.css';
+
+.container {
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: center;
+  background-color: #0A0A0C;
+  height: 100%;
+  width: 100%;
+  padding: 8px 0;
+}
+
+.title {
+  position: relative;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 32px;
+  font-weight: bold;
+  color: #FFFFFF;
+}
+
+.time {
+  position: relative;
+  top: 4px;
+  display: flex;
+  justify-items: center;
+  align-items: center;
+  font-size: 22px;
+  font-weight: bold;
+  color: rgba(255,255,255,0.5);
+}
+
+.leftButton {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  width: 72px;
+  height: 72px;
+}
+
+.box {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+}
+
+.padding {
+  height: 90px;
+}
+
+/* ---------- 知识点头部 ---------- */
+.content-loading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  width: 100%;
+}
+
+.content-loading__text {
+  color: #98989E;
+  font-size: 24px;
+}
+
+.content-header {
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  padding: 8px 24px 0 24px;
+}
+
+/* 学科标签胶囊(div 承载底色+边框,白/蓝字居中,与「原文」同款):保留现页蓝调 #7899BB */
+.content-subject {
+  padding: 4px 12px;
+  margin-bottom: 8px;
+  background-color: rgba(120, 153, 187, 0.12);
+  border-radius: 6px;
+  border: 1px solid rgba(120, 153, 187, 0.4);
+}
+
+.content-subject__text {
+  color: #7899BB;
+  font-size: 20px;
+  font-weight: bold;
+}
+
+.content-title {
+  color: #FFFFFF;
+  font-size: 34px;
+  font-weight: bold;
+  lines: 2;
+  text-overflow: ellipsis;
+}
+
+.content-desc {
+  color: #98989E;
+  font-size: 22px;
+  margin-top: 8px;
+}
+
+.content-divider {
+  width: 100%;
+  height: 1px;
+  background-color: #2A2A2E;
+  margin: 14px 0 8px 0;
+}
+
+/* ---------- 原文区块（特殊标注）：段落式排版，舒适长文阅读 ---------- */
+.content-raw {
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  padding: 4px 24px 6px 24px;
+}
+
+.content-raw__label {
+  color: #C9A86A;
+  font-size: 20px;
+  font-weight: bold;
+  padding: 4px 12px;
+  margin-bottom: 16px;
+  background-color: rgba(201, 168, 106, 0.12);
+  border-radius: 6px;
+  border: 1px solid rgba(201, 168, 106, 0.4);
+}
+
+.content-raw__paragraphs {
+  flex-direction: column;
+  width: 100%;
+}
+
+.content-raw__loading {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 160px;
+}
+
+.content-raw__loading-text {
+  color: #98989E;
+  font-size: 24px;
+}
+
+.content-raw__para {
+  color: #E8E8EC;
+  font-size: 26px;
+  line-height: 38px;
+  text-align: left;
+  margin-bottom: 14px;      /* 段后间距 */
+  word-break: break-word;   /* 长单词/标点自动换行 */
+}
+
+.content-raw__pager {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px 0 4px 0;
+}
+
+.content-raw__pager-btn {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  width: 82px;
+  height: 42px;
+  background-color: rgba(120, 153, 187, 0.12);
+  border: 1px solid rgba(120, 153, 187, 0.4);
+  border-radius: 10px;
+}
+
+.content-raw__pager-btn--disabled {
+  background-color: rgba(120, 153, 187, 0.04);
+  border: 1px solid rgba(120, 153, 187, 0.12);
+}
+
+.content-raw__pager-text {
+  color: #7899BB;
+  font-size: 20px;
+  font-weight: bold;
+}
+
+.content-raw__pager-info {
+  color: #98989E;
+  font-size: 20px;
+  text-align: center;
+}
+
+/* ---------- 公式区块（预渲染占位，蓝调区别于「原文」的金色） ---------- */
+.content-formula {
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  padding: 4px 24px 6px 24px;
+}
+
+.content-formula__label {
+  color: #7899BB;
+  font-size: 20px;
+  font-weight: bold;
+  padding: 4px 12px;
+  margin-bottom: 10px;
+  background-color: rgba(120, 153, 187, 0.12);
+  border-radius: 6px;
+  border: 1px solid rgba(120, 153, 187, 0.4);
+}
+
+/* 公式预渲染图：用固定像素宽 288px（屏宽 336 - 外层 padding 左右各 24 = 288）。
+   不用 width:100% —— 实测 Vela img 在 if 分支首帧时父链百分比宽度未算准，图会缩成很小，
+   息屏再亮触发重排才正常。固定像素让首帧直接按此值布局，不依赖父链时序。
+   高度按图原生宽高比自适应——PNG 是 336 宽截的，288/336 缩放后高度等比。 */
+.content-formula__img {
+  width: 288px;
+  flex-shrink: 0;
+}
+
+/* ---------- 要点列表项 ---------- */
+.content-point {
+  flex-direction: row;
+  align-items: flex-start;
+  width: 100%;
+  padding: 10px 24px;
+}
+
+/* 序号:与「原文」/「学科」同款描边胶囊(淡蓝底 + 蓝框 + 蓝字居中),单/双位数都美 */
+.content-point__index {
+  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  margin-right: 14px;
+  background-color: rgba(120, 153, 187, 0.12);
+  border: 1px solid rgba(120, 153, 187, 0.4);
+  border-radius: 10px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.content-point__index-text {
+  color: #7899BB;
+  font-size: 22px;
+  font-weight: bold;
+  text-align: center;
+  line-height: 22px;
+}
+
+.content-point__text {
+  color: #FFFFFF;
+  font-size: 26px;
+  flex: 1;
+  line-height: 38px;
+}
+
+/* ---------- 空状态 ---------- */
+.content-empty {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 120px;
+}
+
+.content-empty__text {
+  color: #98989E;
+  font-size: 24px;
+}
+
+/* ---------- 公式大图弹层 ---------- */
+/* 全屏黑底覆盖,position:absolute + z-index:999 叠在正文 scroll 之上(沿用 search 输入法键盘范式) */
+.formula-zoom {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  background-color: #0A0A0C;
+  z-index: 999;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* 顶部提示条:档位 + 手势说明 */
+.formula-zoom__hint {
+  width: 100%;
+  padding: 12px 24px;
+  margin-top: 52px;
+  color: #7899BB;
+  font-size: 20px;
+  text-align: center;
+}
+
+/* 自由拖拽区:替代 scroll 的固定方向滚动。监听 touch 跟手 translate,任意方向无约束。
+   overflow 隐藏部分(padding 内是可视区),超大图被拖到可视区外仍可拖回。 */
+.formula-zoom__pad {
+  width: 100%;
+  flex: 1;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+/* 大图:像素宽高由 zoomW/zoomH 内联 style 给出(1x=288,2x=576,3x=864,高按原图比例);
+   transform 由内联 style 给出(跟手 translate),transform-origin 默认中心即可 */
+.formula-zoom__img {
+  flex-shrink: 0;
+}
+</style>
