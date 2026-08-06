@@ -23,8 +23,8 @@ const HS_TAG = '__hs__'
 const HS_TIMEOUT_MS = 10000     // 握手阶段无后续 count 逾时清理
 const HEARTBEAT_INTERVAL_MS = 5000 // 握手成功后周期性回 count=0 保活
 // 手环端版本号:握手时回传给手机端做兼容性校验。与 manifest.json versionCode 同步。
-// (Vela 框架取 manifest.versionCode 的途径不稳,改用常量与发版同步,文档 1.4 表同款做法。)
-const BAND_VERSION_CODE = 1
+  // (Vela 框架取 manifest.versionCode 的途径不稳,改用常量与发版同步,文档 1.4 表同款做法。)
+  const BAND_VERSION_CODE = 2
 
 export default {
   // 把 store 挂到 $def：所有页面通过 this.$app.$def.store 取同一份实例。
