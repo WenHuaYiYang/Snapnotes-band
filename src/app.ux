@@ -5,11 +5,15 @@ import interconnect from '@system.interconnect'
 import app from '@system.app'
 import device from '@system.device'
 import knowledgeStore from './common/knowledgeStore'
+import { base64ToArrayBuffer, sanitizeFileName } from './common/base64'
 
 // 用户数据持久化文件路径:几百 KB 知识点 JSON 走 file 而非 storage(官方把 storage 列为"用完即释放"
 // 不建议存大块数据,见 vela开发文档.md:2735-2818/5256)。internal://files/ 映射到应用私有沙箱
 // /data/quickapp/file/{package}/,重启后仍在(非 cache 可清、非 mass 可能不可用)。
 const USER_DATA_URI = 'internal://files/snapnotes_user_knowledge.json'
+// 用户公式图片目录与索引文件（startFormula 链路落盘/读回,见第 8 章扩展注释）
+const FORMULA_DIR_URI = 'internal://files/formulas/'
+const FORMULA_INDEX_URI = 'internal://files/formulas/index.json'
 // 兼容旧版:探针前用户数据存 storage 这个 key(已落盘过的已装用户走这读回)。
 const LEGACY_STORAGE_KEY = 'snapnotes_user_knowledge'
 
@@ -50,6 +54,12 @@ export default {
   // 首页看不到用户新导入的科目;读回调返校 userSubjects 已填,但 index 已渲染完无法感知,要等下次
   // onShow(翻页返回)才刷新。此处加载成功后广播事件,首页订阅命中即刷新,无需翻页。
   userDataLoaded: false,
+  // 键盘输入震动模式（InputMethod vibratemode 参数，三态: ''=不振动 / 'short'=短振 / 'long'=长振）。
+  // 跨页共享缓存：detail 页设置后写这里 + storage 持久化；search/chat 页 onInit 读这里传给 InputMethod。
+  keyboardVibrateMode: '',
+  // 键盘震动设置持久化 key（轻量 KV 走 @system.storage，与 LEGACY_STORAGE_KEY 同范式；
+  // 不是知识点数据，不走 file 大文件通道）。
+  KEYBOARD_VIBRATE_KEY: 'snapnotes_keyboard_vibrate',
   // 供页面/真接收共用的"接收一条 JSON 字符串"入口:parse→mergeParsedInto→落盘全量快照。
   // 返回 {ok:boolean, reason?:string, len?:number} 让调用方(导入页自验按钮、将来手机端联调)能拿结论。
   // 真接收 onmessage 和导入页本地自验按钮都走这个同一入口,确保两条路径行为完全一致。
@@ -77,19 +87,78 @@ export default {
     })
     return { ok: true, len: s.length, persisted: persistResult.ok }
   },
-  // 删除一个已导入科目:调 store 删 → 落盘全量快照 → 广播 userdata-changed 让 index 页刷新科目数。
+  // 删除一个已导入科目:调 store 删 → 落盘全量快照 → 删该科目的公式图片文件 → 落盘公式索引 → 广播。
   // 仅外部科目(builtinNames 无对应)可删,内置同名延伸条目不在此处理(store.removeSubject 内自带保护)。
   // 返回 {ok:boolean, reason?:string, persisted?:boolean} 供调用方(import 页)提示。
   removeImportedSubject(name) {
+    // 先取该科目公式文件快照(removeSubject 会摘索引条目,须在删除前记下文件名)
+    const doomedFiles = this._collectSubjectFormulaFiles(name)
     const removed = knowledgeStore.removeSubject(name)
     if (!removed) return { ok: false, reason: 'not-found' }
     const persistResult = this._persistCurrentUserData()    // 写回全量快照(删后的 userSubjects)
-    this._broadcastReceive({ kind: 'userdata-changed' })     // 无标志,每次删都发:index/import 同步刷新
-    return { ok: true, persisted: persistResult.ok }
+    this._deleteFormulaFiles(doomedFiles)                   // 删该科目已落盘的公式图片文件(异步,静默)
+    const fiResult = this._persistFormulaIndex()            // 写回删条目后的公式索引快照
+    this._broadcastReceive({ kind: 'userdata-changed' })    // 无标志,每次删都发:index/import 同步刷新
+    return { ok: true, persisted: persistResult.ok && fiResult.ok }
+  },
+  // 收集一个科目在公式索引里的文件名列表(供删除科目时清理磁盘文件)。
+  _collectSubjectFormulaFiles(name) {
+    const idx = knowledgeStore.getUserFormulaIndex()
+    const prefix = name + '#'
+    const files = []
+    for (const key in idx) {
+      if (key.indexOf(prefix) === 0) {
+        if (idx[key] && idx[key].file) files.push(idx[key].file)
+      }
+    }
+    return files
+  },
+  // 删除 internal://files/formulas/ 下的若干文件(逐个 file.delete,失败静默)。
+  _deleteFormulaFiles(files) {
+    if (!files || !files.length) return
+    for (let i = 0; i < files.length; i++) {
+      file.delete({
+        uri: FORMULA_DIR_URI + files[i],
+        success: () => {},
+        fail: () => {}
+      })
+    }
+    console.log('delete formula files: ' + files.length)
+  },
+  // ====== 键盘震动设置:跨页共享缓存 + storage 持久化 ======
+  // 值域与 InputMethod.vibratemode 对齐: '' / 'short' / 'long'。
+  // detail 页切换后调 setKeyboardVibrateMode(mode) 更新 $def 缓存并落 storage;
+  // search/chat 页 onInit 读 getKeyboardVibrateMode() 传给 <input-method vibratemode>。
+  // 启动时从 storage 读回(异步回调里刷新缓存)。
+  getKeyboardVibrateMode() {
+    return this.keyboardVibrateMode || ''
+  },
+  setKeyboardVibrateMode(mode) {
+    const m = (mode === 'short' || mode === 'long') ? mode : ''
+    this.keyboardVibrateMode = m
+    try {
+      storage.set({ key: this.KEYBOARD_VIBRATE_KEY, value: m })
+    } catch (e) {
+      console.log('keyboard vibrate persist FAIL ' + e)
+    }
+    return m
+  },
+  // 启动读回:storage 里的值校正缓存(首次安装无 key → fail 静默,保持默认 '')
+  _loadKeyboardVibrateMode() {
+    storage.get({
+      key: this.KEYBOARD_VIBRATE_KEY,
+      success: (data) => {
+        if (data === 'short' || data === 'long') {
+          this.keyboardVibrateMode = data
+          // 广播:detail 页 onInit 可能早于本异步回调,订阅兜底刷新开关状态
+          this._broadcastReceive({ kind: 'vibrate-loaded' })
+        }
+      },
+      fail: () => {}
+    })
   },
   // 页面订阅接收事件。返回一个 unsubscribe 函数,页面 onDestroy 调即可解订。
-  onReceive(cb) {
-    if (typeof cb !== 'function') return () => {}
+  onReceive(cb) {    if (typeof cb !== 'function') return () => {}
     this._receiveListeners.push(cb)
     return () => {
       const i = this._receiveListeners.indexOf(cb)
@@ -105,6 +174,13 @@ export default {
   onCreate() {
     // 1) 先读回已持久化的用户知识点数据(优先 file,退 storage 兼容旧版/无 file 机型)。
     this._loadPersistedUserData()
+
+    // 1.5) 公式图片目录 + 索引读回:mkdir 失败静默(无 file feature 或目录已存在都无害),
+    //      索引读回失败静默(首装/从未推过公式图),内置公式图不受影响。
+    this._setupFormulaStorage()
+
+    // 1.6) 键盘震动设置读回(storage 轻量 KV,异步回调里校正缓存,默认 '' = 不振动)。
+    this._loadKeyboardVibrateMode()
 
     // 2) 挂 interconnect 接收:手机端配套 app 用 MessageApi.sendMessage(nodeId, byte[]) 推 JSON,
     //    表上 connect.onmessage 收到 String → parse → mergeParsedInto → file 落盘。
@@ -304,14 +380,27 @@ export default {
   // 手机端 FileMessagesFromDevice.Header 认 type, FileMessagesToSend 各消息认 stat)。
   // 流程: startTransfer→回ready(nextChunkIndex:0) → d[i]→追加缓冲→回next_chunk → ... →
   //       手机发完最后一片后发 transferComplete → 手环组装+并入+落盘 → 回 transfer_finished。
+  //
+  // 公式图片扩展(startFormula):同一条 file 链路,复用 d/transferComplete/cancel 与流控。
+  //   startTransfer = 知识点 JSON(分片为纯文本); startFormula = 公式图片(分片为 base64 文本)。
+  //   fileState.mode 区分两种终态处理: 'json' → 组装 JSON 并入用户数据;
+  //   'formula' → 解码 base64 写 internal://files/formulas/<file> 并登记 userFormulaIndex。
+  //   startFormula 字段: subject(科目名), id(知识点 id), filename(md5(subject#id) 前12位+.png,
+  //   手机端 MessageDigest 计算后发来), w/h(图片原始像素宽高,供 content 弹层等比放大)。
   _newFileState() {
     return {
-      buffer: {},          // chunkIndex → 已收内容(用对象当 Map,idx 作 key)
+      mode: 'json',          // 'json' | 'formula'（见上注释）
+      buffer: {},            // chunkIndex → 已收内容(用对象当 Map,idx 作 key)
       totalChunks: 0,
       fileName: '',
       totalBytes: 0,
       receivedChunks: 0,    // 已收片数(判齐)
-      isReceiving: false
+      isReceiving: false,
+      // formula 专属字段(仅 mode='formula' 时有意义)
+      formulaSubject: '',   // 科目名
+      formulaId: 0,         // 知识点 id
+      formulaW: 0,          // 原图像素宽
+      formulaH: 0           // 原图像素高
     }
   },
   _processFileMessage(msg) {
@@ -325,6 +414,22 @@ export default {
         this.fileState.totalBytes = (typeof msg.totalBytes === 'number') ? msg.totalBytes : 0
         this.fileState.isReceiving = true
         console.log('file transfer start: ' + this.fileState.fileName + ' ' + this.fileState.totalBytes + 'B ' + this.fileState.totalChunks + ' chunks')
+        this._sendToPhone({ tag: 'file', type: 'ready', nextChunkIndex: 0 })
+        break
+      }
+      case 'startFormula': {
+        // 公式图片首包:重置状态机(mode='formula'),记录科目/id/文件名/宽高,回 ready 期待 index 0
+        this.fileState = this._newFileState()
+        this.fileState.mode = 'formula'
+        this.fileState.formulaSubject = (typeof msg.subject === 'string') ? msg.subject : ''
+        this.fileState.formulaId = (typeof msg.id === 'number') ? msg.id : 0
+        this.fileState.formulaW = (typeof msg.w === 'number') ? msg.w : 0
+        this.fileState.formulaH = (typeof msg.h === 'number') ? msg.h : 0
+        this.fileState.fileName = sanitizeFileName(msg.filename)
+        this.fileState.totalChunks = (typeof msg.totalChunks === 'number' && msg.totalChunks > 0) ? msg.totalChunks : 0
+        this.fileState.totalBytes = (typeof msg.totalBytes === 'number') ? msg.totalBytes : 0
+        this.fileState.isReceiving = true
+        console.log('formula transfer start: ' + this.fileState.formulaSubject + '#' + this.fileState.formulaId + ' -> ' + this.fileState.fileName + ' ' + this.fileState.totalBytes + 'B ' + this.fileState.totalChunks + ' chunks')
         this._sendToPhone({ tag: 'file', type: 'ready', nextChunkIndex: 0 })
         break
       }
@@ -376,8 +481,9 @@ export default {
         break
     }
   },
-  // 收齐判定 + 组装并入落盘 + 回 transfer_finished。
+  // 收齐判定 + 组装/解码 + 落盘 + 回 transfer_finished。
   // 在 transferComplete 锚点 finalize(手机端只有发完所有片才发此包,片必然已齐)。
+  // mode='json' → 组装完整 JSON 并入用户数据(旧逻辑); mode='formula' → 解码 base64 写图 + 登记索引。
   _finishFileTransfer() {
     const st = this.fileState
     if (!st || !st.isReceiving) {
@@ -390,14 +496,22 @@ export default {
       this._sendToPhone({ tag: 'file', type: 'error', message: 'chunks incomplete ' + st.receivedChunks + '/' + st.totalChunks })
       return
     }
-    // 按 index 升序组装完整 JSON
-    let fullJson = ''
+    // 按 index 升序组装完整内容
+    let full = ''
     for (let i = 0; i < st.totalChunks; i++) {
-      fullJson += st.buffer[i] != null ? st.buffer[i] : ''
+      full += st.buffer[i] != null ? st.buffer[i] : ''
     }
     // 重置状态(先清释放内存,再用本地副本落盘)
     this.fileState = null
-    // 并入 + 落盘(与 receiveImportedJSON 同一条 mergeParsedInto + _persistCurrentUserData)
+
+    if (st.mode === 'formula') {
+      this._finishFormulaTransfer(st, full)
+      return
+    }
+    this._finishJsonTransfer(st, full)
+  },
+  // JSON 知识点链路终态:parse + mergeParsedInto + 落盘全量用户数据快照
+  _finishJsonTransfer(st, fullJson) {
     let ok = false, reason = ''
     try {
       const parsed = JSON.parse(fullJson)
@@ -417,6 +531,44 @@ export default {
     } else {
       this._sendToPhone({ tag: 'file', type: 'error', message: reason })
     }
+  },
+  // 公式图片链路终态:base64 解码 → 写 internal://files/formulas/<file> → 登记索引 → 落盘 index.json
+  _finishFormulaTransfer(st, fullB64) {
+    if (!st.formulaSubject || !st.formulaId) {
+      this._sendToPhone({ tag: 'file', type: 'error', message: 'formula meta missing' })
+      return
+    }
+    const fileUri = FORMULA_DIR_URI + st.fileName
+    const bytes = base64ToArrayBuffer(fullB64)
+    if (!bytes || bytes.byteLength <= 0) {
+      this._sendToPhone({ tag: 'file', type: 'error', message: 'formula empty bytes' })
+      return
+    }
+    file.writeArrayBuffer({
+      uri: fileUri,
+      buffer: new Uint8Array(bytes),
+      append: false,
+      success: () => {
+        // 写盘成功:登记运行时索引 + 落盘 index.json(全量重写)
+        const key = st.formulaSubject + '#' + st.formulaId
+        knowledgeStore.setUserFormulaIndex({
+          [key]: { file: st.fileName, w: st.formulaW, h: st.formulaH }
+        })
+        const persistResult = this._persistFormulaIndex()
+        this._sendToPhone({ tag: 'file', type: 'transfer_finished' })
+        this._broadcastReceive({
+          kind: 'formula-imported',
+          key: key,
+          file: st.fileName,
+          persisted: persistResult.ok
+        })
+        console.log('formula saved: ' + key + ' -> ' + fileUri + ' ' + bytes.byteLength + 'B')
+      },
+      fail: (er) => {
+        console.log('formula write FAIL code=' + (er && er.code))
+        this._sendToPhone({ tag: 'file', type: 'error', message: 'formula write fail code=' + (er && er.code) })
+      }
+    })
   },
 
   // ====== 第 9 章: get_storage_info 存储查询应答 ======
@@ -635,6 +787,53 @@ export default {
     // file.writeText 异步,这里无法同步拿到 success/fail;返回乐观结论"已派发写"。
     // 真实成败由 success/fail 回调记 console;广播里的 persisted 取乐观值。
     return { ok: true }
-  }
+  },
+
+  // ====== 公式图片存储:目录 + 索引读回 + 索引落盘 ======
+  // 用户公式图落 internal://files/formulas/<file>,索引存 internal://files/formulas/index.json。
+  // 索引结构: { "科目名#id": { file, w, h } }(与 knowledgeStore.userFormulaIndex 同构)。
+  // 启动时读回合并进 store,content 页 attachFormulaImg 据此给用户知识点注图。
+  _setupFormulaStorage() {
+    if (!app.canIUse('@system.file')) return
+    file.mkdir({
+      uri: FORMULA_DIR_URI,
+      recursive: true,
+      success: () => {
+        this._loadPersistedFormulaIndex()
+      },
+      fail: () => {
+        // mkdir 失败(目录已存在或平台限制):仍尝试读索引,readText 找不到文件也会走 fail 静默
+        this._loadPersistedFormulaIndex()
+      }
+    })
+  },
+  // 读回 index.json 并合并进 knowledgeStore(失败静默:首装/从未推过公式图)。
+  _loadPersistedFormulaIndex() {
+    file.readText({
+      uri: FORMULA_INDEX_URI,
+      success: (r) => {
+        if (!r || !r.text) return
+        try {
+          knowledgeStore.setUserFormulaIndex(JSON.parse(r.text))
+          console.log('formula index loaded from file')
+        } catch (e) {
+          console.log('formula index parse fail, ignored')
+        }
+      },
+      fail: () => {}
+    })
+  },
+  // 把当前 userFormulaIndex 全量 stringify 写回 index.json(与 _persistCurrentUserData 同风格乐观返回)。
+  _persistFormulaIndex() {
+    if (!app.canIUse('@system.file')) return { ok: false, code: 'no-feature' }
+    const idx = knowledgeStore.getUserFormulaIndex()
+    file.writeText({
+      uri: FORMULA_INDEX_URI,
+      text: JSON.stringify(idx),
+      success: () => { console.log('formula index persisted to file') },
+      fail: (er) => { console.log('formula index persist FAIL code=' + (er && er.code)) }
+    })
+    return { ok: true }
+  },
 }
 </script>

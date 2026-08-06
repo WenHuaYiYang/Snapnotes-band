@@ -17,13 +17,15 @@
     </div>
 
     <!-- 搜索结果列表（键盘显示时缩小高度，给键盘腾出空间） -->
-    <scroll class="box {{ !hideKeyboard ? 'box--with-keyboard' : '' }}" scroll-x="false" scroll-y="true" bounces="true">
+    <!-- scrollbottom 触底增量渲染：命中结果多时（如空泛关键词 150 条）不一次性全建 DOM，
+         首批渲染 12 条，触底 +12。首屏节点受控，滑动不掉帧（vela文档.md:4365 同款推荐）。 -->
+    <scroll class="box {{ !hideKeyboard ? 'box--with-keyboard' : '' }}" scroll-x="false" scroll-y="true" bounces="true" @scrollbottom="loadMore">
       <!-- 加载中占位（首帧先就位，避免进页瞬间预算 150 条 haystack 卡顿） -->
       <div class="search-loading" if="{{!ready}}">
         <text class="search-loading__text" static>加载中...</text>
       </div>
 
-      <div class="subject-item" for="{{searchResults}}" if="{{ready}}" @click="onResultClick($idx)">
+      <div class="subject-item" for="{{renderedResults}}" tid="id" if="{{ready}}" @click="onResultClick($idx)">
         <div class="subject-item__card result-card">
           <text class="result-subject">{{ $item.subjectName }}</text>
           <text class="result-title">{{ $item.title }}</text>
@@ -46,6 +48,7 @@
       keyboardtype="QWERTY"
       screentype="rect"
       maxlength="5"
+      vibratemode="{{vibrateMode}}"
       @complete="onComplete"
       @delete="onDelete"
     ></input-method>
@@ -61,14 +64,19 @@ export default {
     textValue: '',
     hideKeyboard: true,
     searchResults: [],
+    renderedResults: [],  // searchResults 的前缀切片（触底增量渲染，DOM 数量受控）
+    renderedCount: 12,    // 已渲染条数（首批 12，触底每次 +12）
     allItems: [],
     hasSearched: false,
     ready: false,
-    currentTime: '00:00'
+    currentTime: '00:00',
+    vibrateMode: ''        // 键盘震动模式(''/short/long),同步 $def 全局设置传给 InputMethod
   },
 
   onInit() {
     this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
+    // 震动模式:读 $def 缓存(app 启动已从 storage 读回),直接绑 InputMethod.vibratemode
+    this.vibrateMode = this.$app.$def.getKeyboardVibrateMode()
     // 进页即构建 allItems（含预算好的 haystack 缓存），但不渲染。
     // searchResults 保持空，首屏只画占位，避免进页瞬间渲染 150 张卡片的卡顿。
     // haystack 在此预算一次：把学科名/标题/描述/知识要点正文拼成单串并转小写，
@@ -79,30 +87,53 @@ export default {
     setTimeout(() => {
       const items = this.$app.$def.store.getAllItems()
       const all = []
-      for (let i = 0; i < items.length; i++) {
-        const it = items[i]
-        const haystack = (
-          it.subjectName + '\n' +
-          it.title + '\n' +
-          it.desc + '\n' +
-          (it.points || []).join('\n')
-        ).toLowerCase()
-        all.push({
-          title: it.title,
-          desc: it.desc,
-          points: it.points,
-          subjectName: it.subjectName,
-          haystack: haystack
-        })
+      // 分片构建：全部条目 join+toLowerCase 是长任务（语文等大 desc 条目很多），一次性执行
+      // 会占住主线程造成进页后一段冻结。每片 30 条，片间 setTimeout 让出主线程渲染，
+      // 构建期间显示「加载中」占位（ready 保持 false）。
+      const CHUNK = 30
+      let i = 0
+      const step = () => {
+        const end = Math.min(i + CHUNK, items.length)
+        for (; i < end; i++) {
+          const it = items[i]
+          const haystack = (
+            it.subjectName + '\n' +
+            it.title + '\n' +
+            it.desc + '\n' +
+            (it.points || []).join('\n')
+          ).toLowerCase()
+          all.push({
+            id: i,               // 稳定唯一 id，供结果列表 for tid 复用(vela文档.md:7184)
+            title: it.title,
+            desc: it.desc,
+            points: it.points,
+            subjectName: it.subjectName,
+            haystack: haystack
+          })
+        }
+        if (i < items.length) {
+          this.__hayTimer = setTimeout(step, 0)
+        } else {
+          this.__hayTimer = null
+          this.allItems = all
+          this.ready = true
+        }
       }
-      this.allItems = all
-      this.ready = true
+      step()
     }, 50)
   },
 
   onDestroy() {
     if (this.__unsubClock) {
       offTimeChange(this.__unsubClock)
+    }
+    if (this.__hayTimer) {
+      clearTimeout(this.__hayTimer)
+      this.__hayTimer = null
+    }
+    if (this.__loadTimer) {
+      clearTimeout(this.__loadTimer)
+      this.__loadTimer = null
     }
   },
 
@@ -135,12 +166,23 @@ export default {
     }, 220)
   },
 
+  // 取消在途的触底追加批次（新搜索/清空时调用，避免旧批次把结果追加进新结果集）
+  _cancelLoadBatch() {
+    this.__loadingMore = false
+    if (this.__loadTimer) {
+      clearTimeout(this.__loadTimer)
+      this.__loadTimer = null
+    }
+  },
+
   doSearch() {
     const kw = this.textValue.toLowerCase().trim()
     if (!kw) {
       // 关键词清空：保持空态占位，不再回填全部卡片（回填会瞬间渲染 150 张）
+      this._cancelLoadBatch()
       this.hasSearched = false
       this.searchResults = []
+      this.renderedResults = []
       return
     }
     this.hasSearched = true
@@ -152,7 +194,41 @@ export default {
         matched.push(all[i])
       }
     }
+    // 新搜索：取消上一轮触底批次，重置增量渲染计数，只渲染前 12 条；触底再追加
+    this._cancelLoadBatch()
     this.searchResults = matched
+    this.renderedCount = Math.min(12, matched.length)
+    this._applyRenderedResults()
+  },
+
+  // 增量渲染：renderedResults = searchResults 前缀切片（前 renderedCount 条）。
+  // 切片是前缀，onResultClick($idx) 的 $idx 在全量与切片一致，点击跳转不受影响。
+  _applyRenderedResults() {
+    const n = Math.min(this.renderedCount, this.searchResults.length)
+    this.renderedResults = this.searchResults.slice(0, n)
+  },
+
+  // scrollbottom 触底：防连发守卫 + 分批追加（同 knowledge 页范式）。
+  // 触底时 scrollbottom 会连续触发，同步整批 +12 会几帧内把结果全灌进 DOM（触底卡顿根因）。
+  // 合并同一波触底后按 BATCH 分片追加，片间让出主线程；新搜索会 _cancelLoadBatch 取消在途批次。
+  loadMore() {
+    if (this.__loadingMore) return
+    const total = this.searchResults.length
+    if (this.renderedCount >= total) return
+    this.__loadingMore = true
+    const BATCH = 6
+    const target = Math.min(this.renderedCount + 20, total)
+    const tick = () => {
+      this.renderedCount = Math.min(this.renderedCount + BATCH, target)
+      this._applyRenderedResults()
+      if (this.renderedCount < target) {
+        this.__loadTimer = setTimeout(tick, 0)
+      } else {
+        this.__loadTimer = null
+        this.__loadingMore = false
+      }
+    }
+    tick()
   },
 
   goBack() {
@@ -179,7 +255,8 @@ export default {
   background-color: #0A0A0C;
   height: 100%;
   width: 100%;
-  position: relative;
+  padding-top: 8px;        /* 对齐 index 顶部留白：title 垂直位置与其他页一致 */
+  position: relative;    /* 供键盘绝对定位锚定 */
 }
 
 .title {
@@ -189,7 +266,7 @@ export default {
   align-items: center;
   font-size: 32px;
   font-weight: bold;
-  color: #FFFFFF;
+  color: rgba(255, 255, 255, 1);
 }
 
 .time {

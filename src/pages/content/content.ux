@@ -37,10 +37,7 @@
         <!-- 原文（特殊标注）：按字数分页，滚动过程中 DOM 数量固定，避免超长原文越往后越卡 -->
         <div class="content-raw" if="{{raw}}">
           <text class="content-raw__label" static>原文</text>
-          <div class="content-raw__loading" if="{{rawPageLoading}}">
-            <text class="content-raw__loading-text" static>加载中...</text>
-          </div>
-          <div class="content-raw__paragraphs" if="{{!rawPageLoading}}">
+          <div class="content-raw__paragraphs">
             <text class="content-raw__para" for="{{visibleRawParagraphs}}">{{ $item }}</text>
           </div>
           <div class="content-raw__pager" if="{{rawTotalPages > 1}}">
@@ -62,10 +59,12 @@
           <text class="content-point__text">{{ $item }}</text>
         </div>
 
-        <!-- 公式（预渲染 PNG，知识点正文之后；per-point 一张图，宽度满铺高度自适应） -->
+        <!-- 公式（预渲染 PNG，知识点正文之后；per-point 一张图，宽度满铺高度自适应，图水平居中） -->
         <div class="content-formula" if="{{formulaImg}}">
           <text class="content-formula__label" static>公式</text>
-          <img class="content-formula__img" src="{{ formulaImg }}" @click="zoomOpen" />
+          <div class="content-formula__imgwrap">
+            <img class="content-formula__img" src="{{ formulaImg }}" @click="zoomOpen" />
+          </div>
         </div>
 
         <!-- 空状态 -->
@@ -120,8 +119,7 @@ export default {
     visibleRawParagraphs: [],
     rawPage: 1,
     rawTotalPages: 1,
-    rawPageCharLimit: 400,   // 每页字数上限（按段累加，不满一段不拆段）
-    rawPageLoading: false,   // 翻页时短暂显示「加载中」占位，缓解切页卡顿
+    rawPageCharLimit: 320,   // 每页字数上限（按段累加，不满一段不拆段）
     // 公式大图弹层状态
     zoomShow: false,
     zoomScale: 1,        // 档位 1/2/3
@@ -178,10 +176,6 @@ export default {
     if (this.__unsubClock) {
       offTimeChange(this.__unsubClock)
     }
-    if (this.__rawPageTimer) {
-      clearTimeout(this.__rawPageTimer)
-      this.__rawPageTimer = null
-    }
   },
   // 按字数把段落切成多页：逐段累加字数，达上限封页；单段超长独占一页（不拆半句）。
   _buildRawPages() {
@@ -214,20 +208,14 @@ export default {
     const range = this.__rawPageRanges[this.rawPage - 1] || [0, 0]
     this.visibleRawParagraphs = this.rawParagraphs.slice(range[0], range[1])
   },
-  // 翻页：点击瞬间在同一帧内同步清空原页 + 切到「加载中」占位 + 滚到顶，
-  // 下一帧再渲染新页内容。做到原页消失和加载中显示之间无中间态。
+  // 翻页：一次同步完成（换页数据 + 滚到顶）。Vela 同帧合并渲染为单次布局，
+  // 相比旧的「清空→加载中占位→下一帧换内容」三态流程，少一次中间帧与一次布局，弱机翻页更顺。
+  // 页字限 320 让单页文本量可控，直接换页响应足够快，无需加载中占位缓冲。
   _gotoRawPage(next) {
     if (next < 1 || next > this.rawTotalPages || next === this.rawPage) return
     this.rawPage = next
-    this.visibleRawParagraphs = []   // 先清空原页节点
-    this.rawPageLoading = true        // 切到加载中占位
+    this._renderRawPage()
     this._scrollContentTop()
-    const self = this
-    setTimeout(() => {
-      self._renderRawPage()
-      self.rawPageLoading = false
-      self.__rawPageTimer = null
-    }, 16)
   },
   prevRawPage() {
     if (this.rawPage <= 1) return
@@ -492,19 +480,6 @@ export default {
   width: 100%;
 }
 
-.content-raw__loading {
-  flex-direction: row;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  height: 160px;
-}
-
-.content-raw__loading-text {
-  color: #98989E;
-  font-size: 24px;
-}
-
 .content-raw__para {
   color: #E8E8EC;
   font-size: 26px;
@@ -557,6 +532,13 @@ export default {
   align-items: flex-start;
   width: 100%;
   padding: 4px 24px 6px 24px;
+}
+
+/* 图片水平居中容器：包裹层满宽 + 居中，图本身固定像素宽不受父链时序影响 */
+.content-formula__imgwrap {
+  flex-direction: row;
+  justify-content: center;
+  width: 100%;
 }
 
 .content-formula__label {

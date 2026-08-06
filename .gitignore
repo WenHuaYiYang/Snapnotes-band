@@ -17,7 +17,6 @@ _formulas_dump.json
 手机端AI聊天适配说明.md
 拓展内容.md
 知识点JSON文件格式.md
-Amadeus_logo.png
 husky.sh
 jsconfig.json
 vela开发文档.md
@@ -29,3 +28,4 @@ scripts/gen_logo.py
 scripts/gen_prose_check.js
 scripts/generate_prose.js
 .gitignore
+AGENTS.md

@@ -73,6 +73,7 @@
       keyboardtype="QWERTY"
       screentype="rect"
       maxlength="5"
+      vibratemode="{{vibrateMode}}"
       @complete="onComplete"
       @delete="onDelete"
       @visibilityChange="onKeyboardVisibilityChange"
@@ -93,11 +94,14 @@ export default {
     hideKeyboard: true,
     receiving: false,      // 「Amadeus 正在回答…」态
     connectHint: '',       // 空态副文案:未连手机端 / 连了的欢迎语
-    ready: false
+    ready: false,
+    vibrateMode: ''        // 键盘震动模式(''/short/long),同步 $def 全局设置传给 InputMethod
   },
 
   onInit() {
     this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
+    // 震动模式:读 $def 缓存(app 启动已从 storage 读回),直接绑 InputMethod.vibratemode
+    this.vibrateMode = this.$app.$def.getKeyboardVibrateMode()
     // ready=false 让 scroll 内只画「加载中」占位,把 onChat 订阅/interconnect 判定推到下一帧,
     // 标题/时钟/输入条先就位,进页顺滑(同 search/detail/knowledge 范式)。
     setTimeout(() => {
@@ -208,7 +212,8 @@ export default {
   background-color: #0A0A0C;
   height: 100%;
   width: 100%;
-  position: relative;
+  padding-top: 8px;        /* 对齐 index 顶部留白：title 垂直位置与其他页一致 */
+  position: relative;    /* 供键盘 / 输入条 / 对话区绝对定位锚定 */
 }
 
 .title {
@@ -218,7 +223,7 @@ export default {
   align-items: center;
   font-size: 32px;
   font-weight: bold;
-  color: #FFFFFF;
+  color: rgba(255, 255, 255, 1);
 }
 
 .time {
@@ -269,9 +274,9 @@ export default {
 }
 
 /* 键盘弹起:scroll 底边界上抬到 输入条之上(输入条此时在键盘顶上方),
-   bottom = 键盘255 + 输入条区72 + 间距8 = 335 */
+   bottom = 键盘276 + 输入条区72 + 间距8 = 356 */
 .box--with-keyboard {
-  bottom: 335px;
+  bottom: 356px;
 }
 
 .padding {
@@ -371,7 +376,7 @@ export default {
   font-size: 22px;
 }
 
-/* 底部输入条:绝对定位贴底(平时 bottom:8px;键盘弹起时 bottom:263px 顶到键盘顶上方)。
+/* 底部输入条:绝对定位贴底(平时 bottom:8px;键盘弹起时 bottom:284px 顶到键盘顶上方)。
    参考工程 com.bandbbs.ebook 的布局哲学:关键 UI 块用绝对定位,不参与 flex 抢空间,
    避免键盘(position:absolute 贴底)盖住文档流元素的坑。 */
 .chat-input-bar {
@@ -387,9 +392,9 @@ export default {
   box-sizing: border-box;
 }
 
-/* 键盘弹起:输入条从底部抬到键盘顶上方(键盘高 255 + 间距 8 = 263) */
+/* 键盘弹起:输入条从底部抬到键盘顶上方(键盘高 276 + 间距 8 = 284) */
 .chat-input-bar--with-keyboard {
-  bottom: 263px;
+  bottom: 284px;
 }
 
 .chat-input-bar__inner {

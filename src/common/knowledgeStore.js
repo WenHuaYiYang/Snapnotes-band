@@ -35,6 +35,11 @@ const extrasRegistry = {
 // 用户数据缓存。null 表示尚未被 app.ux 注入过（按内置显示）。
 let userSubjects = null
 
+// 用户公式图片索引：key = "科目名#id"，value = { file, w, h }（file 为 internal://files/formulas/ 下的文件名）。
+// 内置公式图走 pointIndex（随包资源），用户推送的公式图走这里（运行时接收 + index.json 持久化）。
+// 由 app.ux 启动时从 internal://files/formulas/index.json 读回（setUserFormulaIndex 合并）。
+let userFormulaIndex = {}
+
 // 复用：内置科目名顺序（保证内置科目置顶、顺序稳定）
 const builtinNames = Object.keys(builtin)
 
@@ -126,6 +131,32 @@ function getUserDataJSON() {
   return JSON.stringify(userSubjects)
 }
 
+/**
+ * 把用户公式图片索引并入 userFormulaIndex（增量式：不重置已有索引）。
+ * 由 app.ux 在收到 startFormula 传输完成时登记新条目、启动读回 index.json 时整体注入。
+ * @param {object} obj key = "科目名#id"，value = {file, w, h}
+ */
+function setUserFormulaIndex(obj) {
+  if (!obj || typeof obj !== 'object') return
+  for (const key in obj) {
+    const v = obj[key]
+    if (!v || !v.file) continue
+    userFormulaIndex[key] = {
+      file: String(v.file),
+      w: Number(v.w) || 0,
+      h: Number(v.h) || 0
+    }
+  }
+}
+
+/**
+ * 取用户公式图片索引当前快照（供 app.ux 落盘 index.json 全量重写）。
+ * @returns {object}
+ */
+function getUserFormulaIndex() {
+  return userFormulaIndex
+}
+
 
 /**
  * 删除一个用户导入科目(仅当 builtinNames 不包含该名时才删——保护内置同名的延伸条目，
@@ -139,6 +170,11 @@ function removeSubject(name) {
   if (builtinNames.indexOf(name) !== -1) return false   // 内置科目名不删
   if (!userSubjects.hasOwnProperty(name)) return false
   delete userSubjects[name]
+  // 同步清理该科目的公式图片索引条目（图片文件删除由 app.ux removeImportedSubject 负责）
+  const prefix = name + '#'
+  for (const key in userFormulaIndex) {
+    if (key.indexOf(prefix) === 0) delete userFormulaIndex[key]
+  }
   return true
 }
 
@@ -208,16 +244,25 @@ function getKnowledge(name) {
  * 仅在条目含 formulas 且 pointIndex 命中时注入；查不到保持原样，content 页 if 判空不渲染公式区。
  */
 function attachFormulaImg(subjectName, list) {
-  if (!pointIndex || !list || !list.length) return
+  if (!list || !list.length) return
   for (let i = 0; i < list.length; i++) {
     const it = list[i]
     if (!it || !Array.isArray(it.formulas) || !it.formulas.length) continue
     if (it.id === undefined || it.id === null) continue
-    const entry = pointIndex[subjectName + '#' + it.id]
+    const pk = subjectName + '#' + it.id
+    // 内置优先（随包资源）；内置查不到再看用户推送的公式图（internal://files/formulas/ 下）
+    const entry = pointIndex && pointIndex[pk]
     if (entry && entry.img) {
       it.formulaImg = entry.img
       it.formulaW = entry.w || 0
       it.formulaH = entry.h || 0
+    } else {
+      const ue = userFormulaIndex[pk]
+      if (ue && ue.file) {
+        it.formulaImg = 'internal://files/formulas/' + ue.file
+        it.formulaW = ue.w || 0
+        it.formulaH = ue.h || 0
+      }
     }
   }
 }
@@ -245,5 +290,5 @@ function getAllItems() {
   return all
 }
 
-export { setUserData, getSubjects, getKnowledge, getAllItems, loadExtraByName, mergeParsedInto, getUserDataJSON, removeSubject }
-export default { setUserData, getSubjects, getKnowledge, getAllItems, loadExtraByName, mergeParsedInto, getUserDataJSON, removeSubject }
+export { setUserData, getSubjects, getKnowledge, getAllItems, loadExtraByName, mergeParsedInto, getUserDataJSON, removeSubject, setUserFormulaIndex, getUserFormulaIndex }
+export default { setUserData, getSubjects, getKnowledge, getAllItems, loadExtraByName, mergeParsedInto, getUserDataJSON, removeSubject, setUserFormulaIndex, getUserFormulaIndex }

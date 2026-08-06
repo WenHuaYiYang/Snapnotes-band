@@ -16,31 +16,32 @@
 
     <div style="height: 6px;"></div>
 
-    <!-- 滚动容器 -->
-    <div class="box">
-      <scroll class="box" scroll-x="false" scroll-y="true" bounces="true">
-        <!-- 加载中占位（首帧先就位，避免进页瞬间渲染 68 张卡片卡顿） -->
-        <div class="knowledge-loading" if="{{!ready}}">
-          <text class="knowledge-loading__text" static>加载中...</text>
-        </div>
+    <!-- 滚动容器：list 原生虚拟化列表（vela开发文档.md:617「list 列表视图容器」）。
+         渲染与计算分离：JS 只算绑定数据，Native 只创建可视区内的 list-item 视图并复用（list-item.md:580「组件复用、优化性能」）。
+         注意：不要做增量追加——每次 slice 重建数组，for 都要全量 diff（vela开发文档.md:7344），
+         触底连发下 diff 成本随 n 线性增长，越往下滑越卡。list 虚拟化后一次绑定全量即可，
+         滚动过程数组不再变化，零追加零 diff。 -->
+    <list class="box" bounces="true">
+      <!-- 加载中占位（独立 type，与知识卡片结构不同，type 隔离避免复用冲突） -->
+      <list-item type="loading" class="knowledge-loading" if="{{!ready}}">
+        <text class="knowledge-loading__text" static>加载中...</text>
+      </list-item>
 
-        <!-- 知识点列表 -->
-        <div class="knowledge-item" if="{{ready}}" for="{{knowledgeList}}" @click="onKnowledgeClick($idx)">
-          <div class="knowledge-card">
-            <text class="knowledge-title">{{ $item.title }}</text>
-            <text class="knowledge-desc">{{ $item.desc }}</text>
-          </div>
-        </div>
+      <!-- 知识点列表（一次绑定全量，Native 虚拟化只建可视区节点） -->
+      <!-- tid="id"：for 节点按 id 复用(vela开发文档.md:7184)。同 type 结构完全一致（单层卡片）。 -->
+      <list-item type="knowledge" class="knowledge-item" if="{{ready}}" for="{{knowledgeList}}" tid="id" @click="onKnowledgeClick($idx)">
+        <text class="knowledge-title">{{ $item.title }}</text>
+        <text class="knowledge-desc">{{ $item.desc }}</text>
+      </list-item>
 
-        <!-- 空状态 -->
-        <div class="knowledge-item" if="{{knowledgeList.length === 0 && ready}}" style="height: 80px; flex-direction: row; align-items: center; justify-content: center;">
-          <text style="color: #98989E; font-size: 24px;" static>暂无知识点</text>
-        </div>
+      <!-- 空状态（与 loading 分属不同 type，if 条件互斥） -->
+      <list-item type="empty" class="knowledge-loading" if="{{ready && knowledgeList.length === 0}}">
+        <text class="knowledge-loading__text" static>暂无知识点</text>
+      </list-item>
 
-        <!-- 底部占位 -->
-        <div class="padding"></div>
-      </scroll>
-    </div>
+      <!-- 底部占位 -->
+      <list-item type="footer" class="padding"></list-item>
+    </list>
 
     <!-- 悬浮按钮 -->
     <img src="/common/images/search.png" @click="openSearch" class="fab fab--search" static />
@@ -65,14 +66,12 @@ export default {
     const name = this.subjectName || '语文'
     this.subjectName = name
     this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
-    // 进页先用空 list：首帧只画标题/空态，避免进页瞬间渲染 68 张卡片(尤其语文)造成卡顿。
+    // 进页先用空 list：首帧只画标题/加载占位，避免进页瞬间渲染 68 张卡片(尤其语文)造成卡顿。
     // 真实数据推迟到下一帧再填充，让标题与背景先就位，68 张卡片在已就绪的页面背景上绘制，
-    // 用户感知的是「页面已开」而非「卡住」。保留 scroll+div for 结构不变，滑动体验不受影响。
-    this.__pendingList = this.getKnowledgeBySubject(name)
-    this.knowledgeList = []
+    // 用户感知的是「页面已开」而非「卡住」。list 虚拟化渲染，Native 只建可视区节点。
+    // 一次性绑定全量：此后数组不变，滚动零追加零 diff，不随 n 退化。
+    this.knowledgeList = this.$app.$def.store.getKnowledge(name)
     setTimeout(() => {
-      this.knowledgeList = this.__pendingList
-      this.__pendingList = null
       this.ready = true
     }, 50)
   },
@@ -80,9 +79,6 @@ export default {
     if (this.__unsubClock) {
       offTimeChange(this.__unsubClock)
     }
-  },
-  getKnowledgeBySubject(name) {
-    return this.$app.$def.store.getKnowledge(name)
   },
   goBack() {
     router.back()
@@ -155,9 +151,10 @@ export default {
 
 .padding {
   height: 90px;
+  width: 100%;
 }
 
-/* 进页加载占位 */
+/* 进页加载占位（list-item 显式宽高以满足组件复用要求） */
 .knowledge-loading {
   flex-direction: row;
   align-items: center;
@@ -173,26 +170,17 @@ export default {
 
 
 /* ---------- 知识点列表项（性能优化：对齐 index 不卡顿的渲染模式） ---------- */
+/* 单层卡片：原 item(88px 透明)+card(74px) 两层合成一层，视觉占位一致，每批追加少建 1/4 原生节点 */
 .knowledge-item {
-  flex-direction: row;
-  align-items: center;
-  justify-content: center;
-  height: 88px;
-  background-color: transparent;
-  padding: 0 12px;
-  margin-bottom: 10px;
-  width: 100%;
-}
-
-.knowledge-card {
   flex-direction: column;
   justify-content: center;
+  height: 88px;
   width: 100%;
-  height: 74px;
   background-color: #18181A;
   border-radius: 20px;
   padding: 0 18px;
   border: 1px solid #2A2A2E;
+  margin-bottom: 10px;
 }
 
 .knowledge-title {
