@@ -18,16 +18,17 @@
 
     <!-- 滚动容器：list 原生虚拟化列表（vela开发文档.md:617「list 列表视图容器」）。
          渲染与计算分离：JS 只算绑定数据，Native 只创建可视区内的 list-item 视图并复用（list-item.md:580「组件复用、优化性能」）。
-         注意：不要做增量追加——每次 slice 重建数组，for 都要全量 diff（vela开发文档.md:7344），
-         触底连发下 diff 成本随 n 线性增长，越往下滑越卡。list 虚拟化后一次绑定全量即可，
-         滚动过程数组不再变化，零追加零 diff。 -->
-    <list class="box" bounces="true">
+         分页加载：参考 com.bandbbs.ebook detail.ux 的 readFileText 异步分块交付思路——
+           初始只取前 12 条（BATCH 6 × 2 片，片间 setTimeout(0) 让出主线程），
+           scrollbottom 触底再分批追加（每批 12 条，片间 setTimeout(0) 不阻塞进程）。
+         全量数据存非绑定字段 __allList，避免几百条塞进数据观测系统。 -->
+    <list class="box" bounces="true" @scrollbottom="loadMore">
       <!-- 加载中占位（独立 type，与知识卡片结构不同，type 隔离避免复用冲突） -->
       <list-item type="loading" class="knowledge-loading" if="{{!ready}}">
         <text class="knowledge-loading__text" static>加载中...</text>
       </list-item>
 
-      <!-- 知识点列表（一次绑定全量，Native 虚拟化只建可视区节点） -->
+      <!-- 知识点列表（分页切片，Native 虚拟化只建可视区节点） -->
       <!-- tid="id"：for 节点按 id 复用(vela开发文档.md:7184)。同 type 结构完全一致（单层卡片）。 -->
       <list-item type="knowledge" class="knowledge-item" if="{{ready}}" for="{{knowledgeList}}" tid="id" @click="onKnowledgeClick($idx)">
         <text class="knowledge-title">{{ $item.title }}</text>
@@ -37,6 +38,11 @@
       <!-- 空状态（与 loading 分属不同 type，if 条件互斥） -->
       <list-item type="empty" class="knowledge-loading" if="{{ready && knowledgeList.length === 0}}">
         <text class="knowledge-loading__text" static>暂无知识点</text>
+      </list-item>
+
+      <!-- 触底加载指示（分页未加载完时显示，加载完或空列表不显示） -->
+      <list-item type="loading-more" class="knowledge-loading knowledge-loading--more" if="{{ready && knowledgeList.length > 0 && knowledgeList.length < totalCount}}">
+        <text class="knowledge-loading__text" static>正在加载...</text>
       </list-item>
 
       <!-- 底部占位 -->
@@ -60,24 +66,30 @@ export default {
   private: {
     knowledgeList: [],
     ready: false,
-    currentTime: "00:00"
+    currentTime: "00:00",
+    // 全量条目数：模板用它与 knowledgeList.length 对比，判断是否还有更多未加载
+    totalCount: 0
   },
   onInit() {
     const name = this.subjectName || '语文'
     this.subjectName = name
     this.__unsubClock = onTimeChange((t) => { this.currentTime = t })
-    // 进页先用空 list：首帧只画标题/加载占位，避免进页瞬间渲染 68 张卡片(尤其语文)造成卡顿。
-    // 真实数据推迟到下一帧再填充，让标题与背景先就位，68 张卡片在已就绪的页面背景上绘制，
-    // 用户感知的是「页面已开」而非「卡住」。list 虚拟化渲染，Native 只建可视区节点。
-    // 一次性绑定全量：此后数组不变，滚动零追加零 diff，不随 n 退化。
-    this.knowledgeList = this.$app.$def.store.getKnowledge(name)
+    // 参考 com.bandbbs.ebook detail.ux 的 readFileText 异步分块交付思路：
+    // 首帧标题/加载占位先就位 → 异步构建全量数据 → 分片异步交付（BATCH 6、片间 setTimeout(0) 让出主线程）。
+    // 初始 + 触底共用一个 _loadMoreChunk，防重入 __loadingMore 守卫。
     setTimeout(() => {
-      this.ready = true
+      this.__allList = this.$app.$def.store.getKnowledge(name) || []
+      this.totalCount = this.__allList.length
+      this._loadMoreChunk()
     }, 50)
   },
   onDestroy() {
     if (this.__unsubClock) {
       offTimeChange(this.__unsubClock)
+    }
+    if (this.__loadTimer) {
+      clearTimeout(this.__loadTimer)
+      this.__loadTimer = null
     }
   },
   goBack() {
@@ -95,6 +107,38 @@ export default {
   },
   openChat() {
     router.push({ uri: '/pages/chat' })
+  },
+  // 参考 com.bandbbs.ebook detail.ux 的 readFileText(offset, cb) 异步分块交付思路：
+  // 每次最多追加 12 条，内部按 BATCH=6 分片，片间 setTimeout(0) 让出主线程渲染，不阻塞进程。
+  // 追加方式：concat 接到现有列表末尾（参考项目 shiftPagesForward 追加新段），
+  // 保持旧引用不重建，tid 复用只 diff 新增项。
+  // 初始首屏加载与 scrollbottom 触底加载共用此方法，__loadingMore 防重入。
+  _loadMoreChunk() {
+    if (this.__loadingMore) return
+    if (this.knowledgeList.length >= this.totalCount) {
+      this.ready = true
+      return
+    }
+    this.__loadingMore = true
+    const BATCH = 6
+    const target = Math.min(this.knowledgeList.length + 12, this.totalCount)
+    const tick = () => {
+      const cur = this.knowledgeList.length
+      if (cur >= target) {
+        this.__loadTimer = null
+        this.__loadingMore = false
+        this.ready = true
+        return
+      }
+      const chunk = this.__allList.slice(cur, Math.min(cur + BATCH, target))
+      this.knowledgeList = this.knowledgeList.concat(chunk)
+      this.__loadTimer = setTimeout(tick, 0)
+    }
+    tick()
+  },
+  // scrollbottom 触底加载：委托给 _loadMoreChunk 统一分片异步交付
+  loadMore() {
+    this._loadMoreChunk()
   }
 }
 </script>
@@ -166,6 +210,13 @@ export default {
 .knowledge-loading__text {
   color: #98989E;
   font-size: 24px;
+}
+
+/* 触底加载指示：小高度、文字居中。
+   最后一张卡片自带 margin-bottom:10px，故「正在加载...」距卡片正好 10px */
+.knowledge-loading--more {
+  height: 40px;
+  justify-content: center;
 }
 
 
