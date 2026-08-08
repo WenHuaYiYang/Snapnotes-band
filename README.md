@@ -8,7 +8,7 @@
 
 ## 安装方法
 
-`.rpk`文件推荐使用[AstroBox](https://astrobox.online/)安装，同时我们官网也提供了下载链接[点我前往官方网站下载界面](https://snapnotes.dpdns.org/download)，你还可以前往项目的[realse(安卓)](https://github.com/WenHuaYiYang/Snapnotes-andriod/releases/tag/stable)、[realse(手环)](https://github.com/WenHuaYiYang/Snapnotes-band/releases/tag/stable)页下载
+`.rpk`文件推荐使用[AstroBox](https://astrobox.online/)安装，同时我们官网也提供了下载链接[点我前往官方网站下载界面](https://snapnotes.dpdns.org/download)，你还可以前往项目的[realse(安卓)](https://github.com/WenHuaYiYang/Snapnotes-andriod/releases)、[realse(手环)](https://github.com/WenHuaYiYang/Snapnotes-band/releases)页下载
 
 ## 它能做什么
 
